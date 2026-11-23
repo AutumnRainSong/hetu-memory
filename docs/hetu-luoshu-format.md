@@ -36,7 +36,10 @@
 
 ```json
 {
-  "id": "mem_01ABC",
+  "node_id": "mem_01ABC",
+  "revision_id": "rev_01ABC_3",
+  "revision_sequence": 3,
+  "content_hash": "sha256:9f2c...",  // 节点正文哈希（防复活拦截键）
   "kind": "memory | entity | annotation | persona_block",
   "version_state": "current | superseded",
   "content_state": "full | minimized | stub | tombstone",
@@ -59,8 +62,9 @@
   "ingested_at": "2026-11-01T08:00:00Z",
   "superseded_by": null,
   "sensitivity_override": "normal | sensitive | restricted",
-  "minimized_blob_ref": null,
+  "minimized_blob_ref": "archive/mem_01ABC/rev_3.txt",  // 洛书包内相对路径（state=minimized 时必填）
   "minimized_at": null,
+  "minimized_blob_hash": null,                         // 归档原文完整性校验
   "scope": {
     "owner_id": "default",
     "layer": "user_identity | agent_persona | global | project | private_annotation",
@@ -97,3 +101,9 @@
 - **Restore vs Merge**：Restore 不重跑淘汰（原样恢复）；Merge 按当前库执行确定性淘汰；无法自动解决的冲突生成报告；**两者共用同一套节点级导入权限验证管线**
 - **导入四步验证**：①scope 自洽（`SCOPE_INVALID` 整节点拒绝）②PRIVATE_LEAK（private 节点 visibility≠owner）→ **全文件拒绝** ③无权限（layer/project 不匹配）→ 跳过+导入报告计数（`IMPORT_SKIPPED`）④sensitivity 覆盖层取更严者
 - **Purge Ledger**：导出携带全量 Ledger（purge_seq/node_id/content_hash/timestamp/reason_category，导出版脱敏去 operator）；导入先应用 Ledger，同 id 或同 content_hash 命中 → `MARKER_CONFLICT` 拒绝
+
+## archive/ 与 blobs/
+
+- `blobs/<hash前缀>/<hash>`：主区原文，按 content_hash 寻址
+- `archive/<node_id>/rev_N.txt`：Minimize 受控归档原文（仅显式授权包携带）
+- 恢复完整性：Revive 时对归档文件计算 SHA-256 与 `minimized_blob_hash` 比对，不匹配 → `ARCHIVE_MISSING`
