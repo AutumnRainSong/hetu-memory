@@ -47,16 +47,94 @@
 
 理由：RAW 的存在价值 = 反思（P2）可回看原始事件 + Digest 失败时的重放来源 + Minimize/Revive 的恢复依据。摘要是有损压缩，一旦允许"摘要内联成功即可删 RAW"，就打开了"压力下静默有损"的口子，违反底线原则。替代策略：死线时**只拒写、不删任何东西**（v1.4 收敛版已是此语义），系统进入只读保护；解除条件 = Digest 恢复或用户显式执行"归档导出+确认清理"（用户主动有损，系统不自动有损）。错误码 `RAW_EMERGENCY_DROP` 移除，保留 `WRITE_PAUSED`。
 
-## 五、里程碑与验收门禁
+## 五、里程碑与验收门禁（与主设计 §9、第一版研发计划统一为 M0-M4 五里程碑）
 
-| 里程碑 | 内容 | 出口门禁 |
+| 里程碑 | 工期 | 内容 | 出口门禁 |
+|---|---|---|---|
+| **M0 工程准备与设计冻结** | 1-2 周 | 工作包 A 全部 + 六项 P0 DDR + 工程骨架 + CI + 矩阵夹具（80 单元） | 文档单一事实源；DDR-001~006 全 DECIDED；CI 首跑 |
+| **M1 最小记忆闭环** | 3-4 周 | Remember → Persist → Recall / 权限过滤 / BM25 基础检索 / 重启持久（内部技术原型） | 六条功能验收 + QA 签认 |
+| **M2 记忆生命周期** | 3-4 周 | Revision / Supersede / Minimize / Revive / Forget / Purge / Purge Ledger | 删除与 Purge 验收（通过前不承载真实敏感数据） |
+| **M3 后台可靠性** | 3-4 周 | RAW / Outbox / Session Digest / Watermark / Backpressure / 故障恢复 | 底线断言 + 压力测试 |
+| **M4 完整 MVP 与发布** | 4-6 周 | 洛书 / Proposal / Embedding / HNSW / RRF / 真实 Adapter / 完整验收 | 毕业考七条门禁 + 大师终验 |
+
+工作包与里程碑映射：A→M0；B→M2（夹具在 M0）；C/D→M2；E→M3；F→M4（schema 在 M0）；G→M4；H→M4。
+
+
+## 五·补：执行任务认领表（Task ID 级，唯一责任人制）
+
+> 负责人以 GitHub 账号占位（`@lead-assignment` = 待招聘认领）；工作量单位 = 人日；状态 = TODO/IN_PROGRESS/DONE/BLOCKED。
+> §10 十二项待详设已编号映射（T-DDR-01~12）。
+
+### M0（工程准备，1-2 周）
+
+| Task ID | 任务 | 负责人 | 协作 | 依赖 | 工作量 | 代码路径 | 测试路径 | 状态 |
+|---|---|---|---|---|---|---|---|---|
+| T-A-01 | 工程骨架 + CI + lint | DevOps | 全员 | 无 | 2 | `ci/` `.github/` | — | TODO |
+| T-A-02 | Migration 框架 + Schema v1（nodes/revisions/edges/outbox/ledger） | 存储主程 | QA | T-A-01 | 3 | `src/storage/migrations/` | `tests/migrations/` | TODO |
+| T-A-03 | 错误码注册表（8+4 错误码） | 服务工程师 | QA | T-A-01 | 1 | `src/errors/registry.ts` | `tests/errors/` | TODO |
+| T-A-04 | behavior-matrix.testdata.json（80 单元） | QA | 技术负责人 | DDR-001 | 3 | `tests/fixtures/behavior-matrix.testdata.json` | `tests/matrix/` | TODO |
+| T-A-05 | DDR-001~006 收敛会 + DDR 记录 | 技术负责人 | 全员+产品 | 无 | 2 | `docs/development/DDR/` | — | TODO |
+
+### M1（最小闭环，3-4 周）
+
+| Task ID | 任务 | 负责人 | 量 | 代码路径 | 测试路径 |
+|---|---|---|---|---|---|
+| T-B-01 | StorageTx.putWithRevision（Node+Revision+Edge+Outbox 原子） | 存储主程 | 3 | `src/storage/tx.ts` | `tests/tx/atomic.spec.ts` |
+| T-B-02 | 链尾唯一性条件写 + CAS_CONFLICT 语义 | 存储主程 | 2 | `src/storage/cas.ts` | `tests/cas/concurrent.spec.ts` |
+| T-C-01 | Identity/Token/Scope 校验中间件 | 服务工程师 | 3 | `src/auth/` | `tests/auth/isolation.spec.ts` |
+| T-C-02 | remember 工具（闸门 ADD） | 服务工程师 | 2 | `src/tools/remember.ts` | `tests/tools/remember.spec.ts` |
+| T-C-03 | recall 工具（BM25+权限前置） | 服务工程师 | 3 | `src/tools/recall.ts` | `tests/tools/recall.spec.ts` |
+| T-C-04 | introspect 工具 | 服务工程师 | 1 | `src/tools/introspect.ts` | `tests/tools/introspect.spec.ts` |
+| T-C-05 | MCP Server 装配 + 错误响应 | 服务工程师 | 2 | `src/mcp/server.ts` | `tests/mcp/adapter.spec.ts` |
+| T-QA-01 | 闭环验收套件（重启持久/隔离/复现） | QA | 3 | `tests/e2e/closed-loop.spec.ts` | — |
+
+### M2（生命周期，3-4 周）
+
+| Task ID | 任务 | 负责人 | 量 | 代码路径 | 测试路径 |
+|---|---|---|---|---|---|
+| T-B-03 | supersede 链 + 链尾级联 | 存储主程 | 3 | `src/storage/chain.ts` | `tests/chain/` |
+| T-C-01a | Minimize 归档区 + Revive（hash 校验/降级） | 存储主程 | 3 | `src/storage/archive.ts` | `tests/archive/` |
+| T-C-02a | Forget→TOMBSTONE | 存储主程 | 1 | `src/storage/lifecycle.ts` | `tests/lifecycle/forget.spec.ts` |
+| T-D-01 | Purge Ledger 表 + 两阶段 Purge + 启动对账 | 存储主程 | 4 | `src/storage/ledger.ts` | `tests/ledger/` |
+| T-D-02 | content_hash 隐私评估（低熵泄露/owner-scoped 摘要方案） | 存储主程+QA | 2 | `docs/development/DDR/DDR-110.md` | — |
+| T-QA-02 | 防复活五通道测试 + 矩阵 80 单元全跑 | QA | 4 | `tests/revival/` | — |
+
+### M3（后台，3-4 周）
+
+| Task ID | 任务 | 负责人 | 量 | 代码路径 | 测试路径 |
+|---|---|---|---|---|---|
+| T-E-01 | RAW 层 + TTL + 配额检查器 | 存储主程 | 3 | `src/raw/` | `tests/raw/quota.spec.ts` |
+| T-E-02 | Outbox 消费 + Session Digest（幂等+watermark 按 Session 分区） | 存储主程 | 4 | `src/digest/` | `tests/digest/` |
+| T-E-03 | 三级背压 + WRITE_PAUSED + digest_stuck | 存储主程 | 2 | `src/raw/backpressure.ts` | `tests/raw/backpressure.spec.ts` |
+| T-QA-03 | 背压压力测试（底线断言：零未归档删除）+ 故障注入 | QA | 4 | `tests/pressure/` | — |
+
+### M4（完整 MVP，4-6 周）
+
+| Task ID | 任务 | 负责人 | 量 | 代码路径 | 测试路径 |
+|---|---|---|---|---|---|
+| T-F-01 | 洛书 v0.3 序列化/反序列化 + JSON Schema | 服务工程师 | 3 | `src/luoshu/` | `tests/luoshu/schema.spec.ts` |
+| T-F-02 | Restore 管线（不重跑淘汰）+ Merge 管线（共用权限管线） | 服务工程师 | 4 | `src/luoshu/pipelines.ts` | `tests/luoshu/roundtrip.spec.ts` |
+| T-G-01 | Proposal 状态机 + FIFO + 两阶段确认 | 服务工程师 | 4 | `src/proposal/` | `tests/proposal/` |
+| T-H-01 | Embedding Worker + HNSW 持久化 + vectorSearch 实现 | 存储主程 | 5 | `src/vector/` | `tests/vector/` |
+| T-H-02 | RRF 融合 + 装配器 + persona pin | 服务工程师 | 3 | `src/recall/` | `tests/recall/rrf.spec.ts` |
+| T-QA-04 | 毕业考七门禁全量执行 | QA | 5 | `tests/graduation/` | — |
+
+### 十二项待详设任务映射（§10 → Task ID）
+
+| 待详设项 | Task ID | 负责人 |
 |---|---|---|
-| **M0 工程准备**（阶段 0，1-2 周） | 工作包 A 全部 + 环境 + CI + 矩阵夹具 | 文档单一事实源；CI 首次跑通矩阵夹具 |
-| **M1 Data Integrity**（阶段一，4-6 周） | 工作包 B/C/D/E | 状态矩阵测试 / DB 一致性 / 防复活 / 跨 Agent 权限 / 大师专项审查 |
-| **M2 性能基础**（阶段二，3-4 周） | 工作包 F/G/H 基础 | 索引恢复 / 召回质量 / 并发压力 / 性能报告 / 大师审查 |
-| **M3 MVP**（阶段三，4-6 周） | 四工具 + MCP + REST + 洛书 + 真实 adapter | 毕业考闭环 + 七条门禁全过 + 大师验收 |
-
-每项任务登记格式：`任务编号 / 优先级 / 主负责人 / 协作者 / 前置依赖 / 交付物 / 验收标准 / 当前状态`——已按第三节表格建立，禁止"团队共同负责"。
+| 1 Top-K 评分函数 | T-B-04 | 存储主程 |
+| 2 时间显式命中误判兜底 | T-H-03 | 服务工程师 |
+| 3 链长触顶归档 | T-B-05 | 存储主程 |
+| 4 Provenance 惩罚公式 | T-H-04 | 服务工程师 |
+| 5 注入检测假阳性处置 | T-H-05 | 服务工程师 |
+| 6 golden QA 阈值与阻断 | T-QA-05 | QA |
+| 7 persona pin/floor 数值 | T-H-06 | 服务工程师+产品 |
+| 8 审计日志保留期 | T-D-03 | 存储主程+产品 |
+| 9 Embedding 选型/维度 | T-H-07 | 存储主程 |
+| 10 RRF k 值 | T-H-08 | 服务工程师 |
+| 11 Proposal TTL/复活规则 | T-G-02 | 服务工程师 |
+| 12 top-K=32/Link≤20 压测校准 | T-QA-06 | QA+存储主程 |
 
 ## 六、待用户确认项
 
