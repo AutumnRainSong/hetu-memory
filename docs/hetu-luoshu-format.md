@@ -1,7 +1,9 @@
-# 洛书 Luoshu · 开放记忆交换格式 v0.2
+# 洛书 Luoshu · 开放记忆交换格式 v0.3
 
 > 河图 HeTu 的数据契约——"数据在用户手里"的载体。任何第三方工具可读取；导入幂等。
-> v0.2：与主规格 v1.4 对齐（三概念分离 / Restore-Merge 分离 / 派生链七字段 / Purge Marker）。
+> v0.3：与主规格 v1.4（收敛版）对齐——节点级 Scope 契约 / Purge Ledger（含 content_hash）/ Minimize 归档字段 / Restore-Merge 共用权限管线。
+
+**节点级是权威数据，文件级仅传输容器；冲突节点级胜出。**
 
 ---
 
@@ -57,6 +59,16 @@
   "ingested_at": "2026-11-01T08:00:00Z",
   "superseded_by": null,
   "sensitivity_override": "normal | sensitive | restricted",
+  "minimized_blob_ref": null,
+  "minimized_at": null,
+  "scope": {
+    "owner_id": "default",
+    "layer": "user_identity | agent_persona | global | project | private_annotation",
+    "project_id": null,
+    "agent_id": null,
+    "visibility": "owner | project_agents | all_agents | shared_list",
+    "shared_with": []
+  },
   "extensions": { }
 }
 ```
@@ -82,4 +94,6 @@
 - **Purge Marker**：随每次导出携带全量；**导入先应用 Marker 再导普通节点**
 - **私有内容**：默认仅导出共享事实；per-agent 注解/persona 需显式授权且单独文件
 - **派生链不重复计数**：origin=session-digest / reflection 的节点不计入"独立来源"佐证
-- **Restore vs Merge**：Restore 不重跑淘汰（原样恢复）；Merge 按当前库执行确定性淘汰；无法自动解决的冲突生成报告
+- **Restore vs Merge**：Restore 不重跑淘汰（原样恢复）；Merge 按当前库执行确定性淘汰；无法自动解决的冲突生成报告；**两者共用同一套节点级导入权限验证管线**
+- **导入四步验证**：①scope 自洽（`SCOPE_INVALID` 整节点拒绝）②PRIVATE_LEAK（private 节点 visibility≠owner）→ **全文件拒绝** ③无权限（layer/project 不匹配）→ 跳过+导入报告计数（`IMPORT_SKIPPED`）④sensitivity 覆盖层取更严者
+- **Purge Ledger**：导出携带全量 Ledger（purge_seq/node_id/content_hash/timestamp/reason_category，导出版脱敏去 operator）；导入先应用 Ledger，同 id 或同 content_hash 命中 → `MARKER_CONFLICT` 拒绝
