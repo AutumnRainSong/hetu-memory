@@ -1,7 +1,7 @@
 # 河图 HeTu · 通用 Agent 记忆模块 —— 架构规格 v1.4（定稿）
 
 > **名实**：系统 **河图 HeTu**（"河出图"——龙马负出的那张最早的图，点即节点、位势即边）
-> **版本**：v1.4（开发前技术收敛定稿）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
+> **版本**：v1.4 收敛定稿（唯一工程基线；收敛报告产出已全部并入本文件，不再存在 v1.5）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
 > 收敛依据：docs/reviews/hetu-v1-convergence-analysis.md 与 docs/reviews/convergence-v15-report.md（五项专项：P0-1/P0-2/P0-3/P1-4/P1-5）
 > **状态**：设计冻结。本版本为团队实现的唯一依据；此后设计变更一律走"提案 → 用户/评审确认 → 文档先行 → 代码跟进"。
 > **配套**：洛书 Luoshu 交换格式（第 7 节）· continue_bro.md（AI 结对入职）· 执行者.md（团队画像）
@@ -75,7 +75,9 @@ Embedding Worker（独立常驻进程）：查询向量缓存 / 批量计算 / �
 | 维度 | 状态 |
 |---|---|
 | 版本 | CURRENT / SUPERSEDED |
-| 内容 | FULL / STUB / TOMBSTONE / PURGED |
+| 内容 | FULL / STUB / **MINIMIZED** / TOMBSTONE / PURGED |
+
+> PURGED 不是节点行上的字段，而是独立擦除账本（Purge Ledger）中的记录——节点物理不存在；状态机保留 PURGED 仅作导入兼容的概念终态（详见 §3.3）。MINIMIZED 为受控归档态（§3.1 收敛 P0-1）。`SUPERSEDED × {MINIMIZED, TOMBSTONE, PURGED}` 为不可达非法组合（历史随链尾级联）。
 
 历史版本可 FULL（时间回溯需要）也可被 Minimize/Forget——两维独立演化。
 
