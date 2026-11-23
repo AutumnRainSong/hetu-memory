@@ -44,6 +44,28 @@
 │ 具身（JSON 扩展位）/ 跨设备同步 / 云托管 / 多用户 owner_id  │
 └────────────────────────────────────────────────────────┘
 
+### 1.1 Storage SPI 事务与原子性契约（收敛 P0-3 补充）
+
+六原语之上的**一致性规则**（跨进程有效，不依赖应用内队列/锁）：
+
+```ts
+// 事务块：Node+Revision+Edge+Outbox 同一 SQLite 事务原子提交
+interface StorageTx {
+  putWithRevision(node: ImmutableNode, edges: Edge[], outbox: OutboxEntry[],
+                  cas?: { expectedRevision: RevisionId }): Promise<TxResult>;
+  minimize(id: NodeId, archive: BlobHandle, cas: Cas): Promise<TxResult>;   // 归档写+主区引用改，单事务
+  purge(id: NodeId): Promise<TxResult>;                                     // Ledger 先行（提交点）→ 级联删除；崩溃后启动对账补删
+  revive(id: NodeId): Promise<TxResult>;                                    // TOMBSTONE→FULL，校验归档 hash
+}
+```
+
+- **CAS 失败语义**：返回 `{ok:false, error:'CAS_CONFLICT', currentRevision}`，调用方重读最新状态重新决策（不重放旧操作）
+- **幂等键**：Outbox 条目 (kind, entity_id, seq) 唯一约束在 DB 内，消费端按键去重
+- **Outbox 原子性**：Outbox 条目与业务数据在同一事务写入（无独立"先写后通知"窗口）
+- **Purge Ledger**：独立表；purge() 事务 = Ledger insert（提交点）→ 级联删除；崩溃后启动对账"Ledger 有而节点表有 → 补删"
+- **Minimize 一致性**：先写归档 blob → 单事务内改 content_state 与 minimized_blob_ref → 主区 blob 延迟 GC；启动对账修复半途状态
+- **多进程**：SQLite WAL + busy_timeout + Writer 队列（单写者进程）+ 存储层条件写；不变量全部由 DB 约束承载
+
 Embedding Worker（独立常驻进程）：查询向量缓存 / 批量计算 / 模型
 版本管理 / 维度校验；模型升级 = 旧向量标记版本 → 后台重算 → 原子切换
 ```
@@ -125,6 +147,8 @@ STUB 历史仅经独立历史查询接口（显式授权）访问。
 | SUPERSEDED/STUB | `STATE_CONFLICT` | ❌ | ✅ | `STATE_CONFLICT` | `STATE_CONFLICT` | `STATE_CONFLICT` | `STATE_CONFLICT` | ❌ |
 | SUPERSEDED/TOMBSTONE · SUPERSEDED/PURGED · SUPERSEDED/MINIMIZED | 不可达 N/A（属性测试证明无操作序列可达） | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 
+**矩阵单元统计（统一口径）**：2 版本 × 5 内容 = **10 组合**；其中 3 组不可达（SUPERSEDED × 删除/归档态）。**80 个矩阵单元 = 56 个可达行为测试格 + 24 个不可达组合证明格**。56 格执行行为测试，24 格执行"无操作序列可达"属性证明。操作全集 = 8 个（remember/recall/introspect/Minimize/Forget/Purge/Revive/supersede）；reinforce/annotate/link 遵循"仅作用于可读写内容态"的同构规则，不单独成列（其前置条件在 B 包工作内定义）。
+
 错误码：`STATE_CONFLICT`（状态不允许）/ `PURGED_FINAL`（永久擦除）/ `STUB_IMMUTABLE` / `ARCHIVE_MISSING`（归档丢失，恢复降级）/ `INVALID_STATE`（操作对该状态无意义）/ `QUOTA_HARD_LIMIT` / `PERMISSION_DENIED` / `WRITE_PAUSED`（背压，P1-4）/ `MARKER_CONFLICT`（导入遇 Marker 同 id 内容）。
 
 ### 3.3 Purge Ledger（擦除账本）与防复活（收敛 P0-3：采用账本方案，PURGED 非库内状态）
@@ -180,9 +204,9 @@ Raw Event 先持久化 → 会话结束 → Digest 任务 Outbox 登记（幂等
 - **单 Session 上限 50MB**：超出拒绝 `SESSION_RAW_QUOTA` 并触发该会话即时 Digest（插队）；不自动截断、不自动删。
 - **Digest 连续失败**：指数退避（1m→30m 封顶）；连续 5 次 → 标 `digest_stuck` 红色告警；**不 GC、不降级伪造摘要**。
 - **GC 水位线跟随最小未完成 watermark**：Digest 全挂 → watermark 不前进 → RAW 停 GC、写入被拒 → 系统"只读保护"而非"静默清理"。
-- **磁盘真满（宿主级）**：最后手段丢弃最旧 RAW 前必须摘要内联成功，打 `RAW_EMERGENCY_DROP` 审计；`DISK_FULL` 与配额错误码分离。
+- **磁盘真满（宿主级）**：**不丢弃任何 RAW**（DDR-109 裁决：摘要不构成安全归档，`RAW_EMERGENCY_DROP` 已从设计中移除）；返回 `DISK_FULL` 独立错误码进入只读保护；解除 = Digest 恢复或用户显式"归档导出+确认清理"（用户主动有损，系统永不自动有损）。
 - **重启恢复**：RAW 扫描重建配额计数；stuck 批按退避表续跑；TTL/GC 指针持久化。
-- **底线承诺：任何故障注入序列下，不静默删除未安全归档的原始记忆**（压力测试断言）。
+- **底线承诺（DDR-109）：任何故障注入序列下，系统不自动删除未安全归档的原始记忆**——死线只拒写（`WRITE_PAUSED`）；宿主磁盘真满返回 `DISK_FULL` 只读保护；有损清理仅存在于用户显式"导出+确认清理"流程（压力测试断言）。
 
 ## 5. 召回管线（权限前置）
 
@@ -275,10 +299,12 @@ provenance 七字段（origin/method/source_refs/producer_version/model_id/gener
 
 | 阶段 | 内容 | 出口 |
 |---|---|---|
-| **一 数据正确性与安全** | 双维度状态机 / 三操作 / 权限 Scope / 硬过滤 / 洛书契约 / Purge Marker | 大师专项审查 |
-| **二 性能基础设施** | HNSW 持久化 / Embedding Worker / Writer 队列+Outbox / Fast Path / 批量读取 / 监控 | 性能验收数据 |
-| **三 基础记忆能力（MVP）** | 记/忆/忘/察 + 导入导出 + 跨会话回忆 + 删除恢复 | 毕业考（见 §11） |
-| **四 智能化扩展（P2）** | 图谱扩散 / 反思 SCHEDULED / LLM 消歧 / 实体合并 / 程序性记忆 / 多 Agent 调度 | 按需启动 |
+| **M0 工程准备与设计冻结**（1-2 周） | 六项 P0 决策（DDR-001~006）/ 工程骨架 / CI / Migration 框架 / 接口契约 / 测试夹具 | 设计冻结签认 |
+| **M1 最小记忆闭环**（3-4 周） | Remember → Persist → Recall / 权限过滤 / BM25 基础检索 / 重启持久 | 六条功能验收（仅内部技术原型） |
+| **M2 记忆生命周期**（3-4 周） | Revision / Supersede / Minimize / Revive / Forget / Purge / Purge Ledger | 删除与 Purge 验收（通过前不承载真实敏感数据） |
+| **M3 后台可靠性**（3-4 周） | RAW / Outbox / Session Digest / Watermark / Backpressure / 故障恢复 | 底线断言 + 压力测试 |
+| **M4 完整 MVP 与发布**（4-6 周） | 洛书 / Proposal / Embedding / HNSW / RRF / 真实 Adapter / 完整安全与性能验收 | 毕业考（见 §11） |
+| **P2 智能化扩展** | 图谱扩散 / 反思 SCHEDULED / LLM 消歧 / 实体合并 / 程序性记忆 / 多 Agent 调度 | M4 稳定后按需启动 |
 
 ## 10. 待详设清单（实现前补齐，不阻塞启动）
 
