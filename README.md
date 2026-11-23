@@ -34,6 +34,15 @@
 记住 → 跨会话召回 → 删除 → 不再出现 → 导出（洛书）→ Restore → Purge 内容不复活
 ```
 
+## 工程状态（2026-11-23）
+
+- ✅ **M0 工程骨架已就绪**：TypeScript + Node 22 内置 SQLite（`node:sqlite`）+ Vitest + GitHub Actions CI
+- ✅ 六项 P0 DDR 全部 **DECIDED**（[工程设计决策清单](docs/development/工程设计决策清单.md)）
+- ✅ 行为矩阵夹具 **80 单元**（56 可达行为测试 + 24 不可达属性证明）入库
+- ✅ 洛书 v0.3 正式 JSON Schema + 样例（含 PRIVATE_LEAK 拒绝用例）
+- ✅ **15 个测试全绿**（矩阵完整性 5 / Migration 幂等与不变量 5 / 洛书 Schema 3 / smoke 2）
+- ▶ 下一里程碑 **M1**：Remember → Persist → Recall 最小记忆闭环
+
 ## 实施路线
 
 阶段一 数据正确性与安全 → 阶段二 性能基础设施 → 阶段三 MVP（记/忆/忘/察）→ 阶段四 智能化扩展
