@@ -1,7 +1,7 @@
 # 河图 HeTu
 
 > 通用 Agent 记忆模块 · 跨框架、本地优先、数据归用户
-> 设计规格 v1.4（定稿）· 9 轮审查协商闭环
+> 设计规格 v1.4（定稿）· 11 轮审查协商闭环
 
 **河出图**——龙马负出的那张图，是华夏最早的结构化知识图谱：点是节点，位势是边。河图把这张图变成 agent 的记忆：不可变节点、supersede 版本链、带权关联边、权限前置过滤、可带回溯的生命周期。
 
@@ -11,7 +11,7 @@
 |---|---|
 | [docs/agent-memory-module-design.md](docs/agent-memory-module-design.md) | **主规格 v1.4**——架构、数据模型、行为矩阵、治理规则、路线图 |
 | [docs/hetu-luoshu-format.md](docs/hetu-luoshu-format.md) | 洛书——开放记忆交换格式（数据在用户手里的契约） |
-| [docs/continue_bro.md](docs/continue_bro.md) | AI 结对执行者入职文档（十条设计纪律 + 交接） |
+| [continue_bro.md](continue_bro.md) | AI 结对执行者入职文档（十条设计纪律 + 交接） |
 | [docs/执行者.md](docs/执行者.md) | 实现团队画像——岗位、筛人题、验收门禁 |
 | [docs/reviews/](docs/reviews/) | 审查与协商档案（外部评审往返记录） |
 
