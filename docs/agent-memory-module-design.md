@@ -1,7 +1,8 @@
 # 河图 HeTu · 通用 Agent 记忆模块 —— 架构规格 v1.4（定稿）
 
 > **名实**：系统 **河图 HeTu**（"河出图"——龙马负出的那张最早的图，点即节点、位势即边）
-> **版本**：v1.4 定稿 · 2026-11-23 · 9 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2）
+> **版本**：v1.4（开发前技术收敛定稿）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
+> 收敛依据：docs/reviews/hetu-v1-convergence-analysis.md 与 docs/reviews/convergence-v15-report.md（五项专项：P0-1/P0-2/P0-3/P1-4/P1-5）
 > **状态**：设计冻结。本版本为团队实现的唯一依据；此后设计变更一律走"提案 → 用户/评审确认 → 文档先行 → 代码跟进"。
 > **配套**：洛书 Luoshu 交换格式（第 7 节）· continue_bro.md（AI 结对入职）· 执行者.md（团队画像）
 
@@ -97,29 +98,43 @@ Embedding Worker（独立常驻进程）：查询向量缓存 / 批量计算 / �
 
 | 操作 | 语义 | 普通 recall |
 |---|---|---|
-| Minimize 精简 | 删原文留摘要与关联 | 可见（摘要） |
+| Minimize 精简 | 原文移入**受控归档区**（移出检索面，物理保留）；摘要与关联保留 | 可见（摘要）；原文仅历史接口可达 |
 | Forget 删除 | 软删除 → TOMBSTONE | **完全不可见** |
 | Purge 擦除 | 清理受控存储+全部派生数据 | 物理消失 |
 
 STUB 历史仅经独立历史查询接口（显式授权）访问。
 
-### 3.2 行为矩阵（5 内容状态 × 工具，表驱动测试不过不合并）
+**Minimize 可逆性（收敛 P0-1）**：采用受控归档方案——原文移入归档区（主索引/FTS/HNSW/recall 全部移除引用，归档区独立配额不计入 RAW 500MB），Revive 从归档取回原文校验 content_hash 后内容态回 FULL；归档缺失/哈希不匹配 → 降级恢复到摘要级并报 `ARCHIVE_MISSING`（不静默）。Purge(MINIMIZED) 必须级联擦除归档区原文——Purge 与 Minimize 边界闭合。崩溃对账：先写归档、后删主区、再改状态；启动对账修复半途状态。Minimize 的产品语义 = "从可见性中移除原文"，**不承诺物理删除**（需物理删除走 Forget/Purge），UI 明示。
 
-| 规则 | 内容 |
-|---|---|
-| 写短路 | TOMBSTONE/PURGED 对 reinforce/annotate/link/remember 短路（`MEM_TOMBSTONED`/`MEM_PURGED`） |
-| Forget×FULL | 转 TOMBSTONE（宿主 UI 确认）；×STUB 同左 |
-| Minimize×FULL | 转 STUB（可逆）；×TOMBSTONE=E |
-| Purge 入口 | ×(STUB\|TOMBSTONE\|FULL)=purge() 唯一硬擦除入口；单次高危确认；审计仅 id/操作者/时间戳/原因类别 |
-| recall | FULL=W；SUPERSEDED+FULL=时间显式命中正常权重沿链返回、非时间命中硬降权；TOMBSTONE/PURGED=**E 不可见** |
-| revive | 仅 TOMBSTONE 显式恢复；re-created_from 独立节点不回挂旧链 |
-| introspect | 仅权限位；suspended 只读；revoked 401 |
+**内容轴新增第 5 状态 MINIMIZED**（收敛 P0-1/P0-2）：STUB 变体升级为独立状态；`SUPERSEDED × {TOMBSTONE, PURGED, MINIMIZED}` 为**不可达非法组合**（Forget/Purge 优先于 supersede：对历史版本单独删除拒绝 `STATE_CONFLICT`，链上历史随链尾级联；对链尾 Purge 即整链逐节点入账本）。
 
-权限模板三级（只读/可写注解/全读写）× 写意图三级（append/状态更新/破坏性）；**授权映射到意图**；二次确认由宿主 UI（MCP elicitation / REST 回调），宿主 LLM 无权自确认。
+### 3.2 行为矩阵（2 版本 × 5 内容 = 10 组合，其中 3 组不可达；表驱动测试不过不合并）
 
-### 3.3 Purge Marker 防复活
+完整矩阵（操作 × 状态组合，ALLOW/错误码/迁移；YAML 表驱动夹具即测试数据，禁止测试代码内联期望值）：
 
-Marker 独立于节点（id+删除序列号+时间戳，不含正文）；随导出携带全量；**导入先应用 Marker 再导节点**；全链检查（Blob/FTS/HNSW/缓存/WAL/备份/日志）；restore 重放本机 purge 审计。**边界声明**：完全离线长期未同步的备份无法远程撤销——产品文档明示。
+| 状态\操作 | remember | recall | introspect | Minimize | Forget | Purge | Revive | supersede(作为源) |
+|---|---|---|---|---|---|---|---|---|
+| CURRENT/FULL | W（闸门四操作） | ✅ | ✅ 全字段 | →MINIMIZED | →TOMBSTONE | →账本+节点物理删 | `INVALID_STATE` | ✅（源转 SUPERSEDED） |
+| CURRENT/STUB | `STUB_IMMUTABLE`（提示走新 remember） | ✅ 仅摘要 | ✅ | →MINIMIZED | →TOMBSTONE | →账本删 | `INVALID_STATE` | ✅ |
+| CURRENT/TOMBSTONE | `STATE_CONFLICT`（复活走 Revive） | ❌ 不可见 | ✅ 仅元数据 | `STATE_CONFLICT` | 幂等 | ✅（终态清理） | →FULL（原文在）/`ARCHIVE_MISSING` 降级 | `STATE_CONFLICT` |
+| CURRENT/PURGED | `PURGED_FINAL` | ❌ | ✅ 仅 Marker 元数据 | N/A | N/A | 幂等 | `PURGED_FINAL` | N/A |
+| CURRENT/MINIMIZED | `STATE_CONFLICT` | ✅ 仅摘要（标 minimized） | ✅ | 幂等 | ✅（级联删归档） | ✅（级联删归档） | →FULL | ✅ |
+| SUPERSEDED/FULL | `STATE_CONFLICT` | ❌（显式链查询除外） | ✅ | `STATE_CONFLICT` | `STATE_CONFLICT`（随链尾级联） | `STATE_CONFLICT` | `STATE_CONFLICT` | ❌（已被替代） |
+| SUPERSEDED/STUB | `STATE_CONFLICT` | ❌ | ✅ | `STATE_CONFLICT` | `STATE_CONFLICT` | `STATE_CONFLICT` | `STATE_CONFLICT` | ❌ |
+| SUPERSEDED/TOMBSTONE · SUPERSEDED/PURGED · SUPERSEDED/MINIMIZED | 不可达 N/A（属性测试证明无操作序列可达） | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+
+错误码：`STATE_CONFLICT`（状态不允许）/ `PURGED_FINAL`（永久擦除）/ `STUB_IMMUTABLE` / `ARCHIVE_MISSING`（归档丢失，恢复降级）/ `INVALID_STATE`（操作对该状态无意义）/ `QUOTA_HARD_LIMIT` / `PERMISSION_DENIED` / `WRITE_PAUSED`（背压，P1-4）/ `MARKER_CONFLICT`（导入遇 Marker 同 id 内容）。
+
+### 3.3 Purge Ledger（擦除账本）与防复活（收敛 P0-3：采用账本方案，PURGED 非库内状态）
+
+**PURGED 不是节点行上的字段，而是独立擦除账本（Purge Ledger，append-only）中的记录**；Purge 后原始节点物理不存在（行/revision/边/FTS/HNSW/blob 全部级联删除）。
+
+- **Ledger 条目（最小信息，不含正文/摘要/embedding）**：`purge_seq（全局单调）, node_id, content_hash, operator, timestamp, reason_category`。content_hash 是防复活关键（换 id 重建也按 hash 拦截）；导出携带版脱敏（去 operator）。
+- **两阶段 Purge**：先写 Ledger（提交点）→ 后级联删除；崩溃后启动对账（Ledger 有而节点表有 → 补删），任何崩溃序列不产生"内容已删无 Marker"或"Marker 无但内容在"以外的中间态。
+- **Marker 与节点状态关系**：Purge Marker = Ledger 条目的导出投影，是已 Purge 内容的唯一残迹。
+- **防复活五通道**：①导入 Ledger 优先于一切内容（同 id 或同 content_hash 命中 → `MARKER_CONFLICT` 拒绝）②Purge 时 blob 立即删除 + GC 引用计数兜底孤儿 ③FTS/HNSW Purge 事务内同步删 + 启动对账（索引 id 不在节点表 → 删）④备份内嵌 Ledger 快照，恢复后合并取 purge_seq 并集，命中的旧节点恢复时即物理丢弃 ⑤缓存键含 revision_id，节点删后失效事件+TTL 上限封顶。
+- **避免防复活长期保留敏感信息**：Ledger 仅含不可逆标识；P2 `purge_ledger_compact`（超期无冲突风险条目脱敏为 {purge_seq, timestamp, reason_category}）；数据模型已预留。
+- **边界声明**：完全离线长期未同步的备份无法远程撤销——产品文档明示。
 
 ### 3.4 宿主状态迁移 × 注解联动
 
@@ -151,6 +166,21 @@ SUPERSEDED 注解原位；Minimize/Forget 跟随内容状态；Purge 先墓碑�
 ### 4.2 Session Digest 可靠性流程（v1.3 收敛 ①）
 
 Raw Event 先持久化 → 会话结束 → Digest 任务 Outbox 登记（幂等键）→ 执行（确定性规则：实体/事实/时间/意图/片段索引；**确定性摘要不得自动写入高可信语义记忆**）→ source_event_watermark 记录覆盖范围 → **提交成功前对应 RAW 不 GC** → 异常全覆盖（进程崩溃/连接中断/Digest 崩溃/重复消费/用户删除联动）→ 崩溃会话恢复扫描补偿触发。
+
+### 4.3 RAW 配额背压（收敛 P1-4：三级阈值，死线拒写不删数据）
+
+| 阈值 | 触发行为 |
+|---|---|
+| 软 80%（400MB） | 告警（面板+trace）+ Digest Worker 提级；**正常接收写入** |
+| 硬 95%（475MB） | 暂停全部后台淘汰/压缩类任务（Outbox 消费与 Digest 保留）；继续接收写入 |
+| 死线 100% | **拒绝新的 remember/RAW 写入**（`WRITE_PAUSED`，HTTP 503+Retry-After）；recall/introspect 不受影响 |
+
+- **单 Session 上限 50MB**：超出拒绝 `SESSION_RAW_QUOTA` 并触发该会话即时 Digest（插队）；不自动截断、不自动删。
+- **Digest 连续失败**：指数退避（1m→30m 封顶）；连续 5 次 → 标 `digest_stuck` 红色告警；**不 GC、不降级伪造摘要**。
+- **GC 水位线跟随最小未完成 watermark**：Digest 全挂 → watermark 不前进 → RAW 停 GC、写入被拒 → 系统"只读保护"而非"静默清理"。
+- **磁盘真满（宿主级）**：最后手段丢弃最旧 RAW 前必须摘要内联成功，打 `RAW_EMERGENCY_DROP` 审计；`DISK_FULL` 与配额错误码分离。
+- **重启恢复**：RAW 扫描重建配额计数；stuck 批按退避表续跑；TTL/GC 指针持久化。
+- **底线承诺：任何故障注入序列下，不静默删除未安全归档的原始记忆**（压力测试断言）。
 
 ## 5. 召回管线（权限前置）
 
@@ -188,24 +218,44 @@ Raw Event 先持久化 → 会话结束 → Digest 任务 Outbox 登记（幂等
 
 ### 7.1 三概念分离
 
-node_id（稳定身份）· revision_id（版本）· content_hash（完整性校验）。
+node_id（稳定身份）· revision_id / revision_sequence（版本）· content_hash（完整性）。幂等键 (owner_id, node_id, content_hash) 仅识别重复；版本冲突按 revision_id——旧快照不覆盖新版本。
 
 ### 7.2 Restore 与 Merge 分离
 
 | | Restore | Merge |
 |---|---|---|
-| 节点/边/边权/状态 | 原样恢复 | 冲突检查后合并 |
-| Top-K 淘汰 | **不重跑** | 执行（确定性规则） |
-| Purge Marker | 优先于旧备份节点 | 同左 |
+| 节点/边/边权/状态 | 原样恢复（**不重跑淘汰**） | 冲突检查后按确定性淘汰合并 |
+| Purge Ledger | 优先于旧备份节点，命中即物理丢弃 | 同左 |
 | 冲突 | 完整性验证 | 无法自动解决→报告+导入审计 |
 
-### 7.3 派生来源链
+**Restore 与 Merge 共用同一套节点级导入权限验证管线**（校验→过滤→落库差异仅在落库动作）——杜绝"Restore 绕过权限"漏洞。
 
-洛书节点 provenance 含七字段（origin/method/source_refs/producer_version/model_id/generated_at/confidence）。**派生链不重复计数**：A → Digest A → Reflection A ≠ 三个独立来源。
+### 7.3 节点级 Scope 与可见性契约（收敛 P1-5）
 
-### 7.4 导入幂等与冲突
+每节点自带 scope 块（**节点级是权威数据，文件级仅传输容器；冲突节点级胜出**）：
 
-幂等键 (owner_id, node_id, content_hash) 识别重复；revision_id 比较版本——旧快照不覆盖新版本；同 ID 异内容→冲突报告；悬空 superseded_by→占位墓碑+warning；Purge Marker 永远优先。
+```
+scope:
+  owner_id: 必填（导出不可变）
+  layer: user_identity | agent_persona | global | project | private_annotation
+  project_id: layer=project 时必填，否则禁止
+  agent_id: layer=agent_persona|private_annotation 时必填
+  visibility: owner | project_agents | all_agents | shared_list
+  shared_with: visibility=shared_list 时的 agent id 列表
+```
+
+- 五类归属字段约束：User Identity→agent_id 禁止；Agent Persona/Private Annotation→agent_id 必填；Project→project_id 必填；**Private Annotation visibility 强制 = owner（硬约束，导入校验强制重写）**
+- **导出过滤**：默认 visibility=shared 集合；Private Annotation 默认不导出（`include_private=true` + 宿主 UI 二次确认）；persona 默认导出可 flag 排除
+- **导入四步验证**：①scope 自洽（层与字段匹配）→ `SCOPE_INVALID` 整节点拒绝 ②PRIVATE_LEAK（private 节点 visibility≠owner）→ **全文件拒绝**（导出方被篡改，不部分导入）③导入方无权限（layer/project 不匹配）→ 跳过该节点+导入报告计数（`IMPORT_SKIPPED`），**从不静默改归属** ④sensitivity 覆盖层随节点携带，导入取更严者
+- 文件级 owner 仅作导出者元数据，不作权限依据；shared_list 只是"允许"非"充分"，导入方仍本地校验
+
+### 7.4 派生来源链
+
+provenance 七字段（origin/method/source_refs/producer_version/model_id/generated_at/confidence）。派生链不重复计数：A → Digest A → Reflection A ≠ 三个独立来源。
+
+### 7.5 导入幂等与冲突
+
+幂等键 (owner_id, node_id, content_hash)；revision_id 比较——旧快照不覆盖新版本；同 ID 异内容→冲突报告；悬空 superseded_by→占位墓碑+warning；Purge Ledger 永远优先；导入为事务性批次，失败整体回滚；content_hash 相同重复导入幂等跳过。
 
 ## 8. 评测与运维
 
@@ -264,7 +314,8 @@ node_id（稳定身份）· revision_id（版本）· content_hash（完整性�
 | 7 | 外部评审 | 双维度状态机、删除三操作、Purge Marker、权限前置、五类归属、Embedding Worker、候选预算、性能标准 |
 | 8 | 后台协商 | 三层后台、Session Digest、Top-K 淘汰、边容量分立 |
 | 9 | 收敛协商 | Annotation 体验优先、Proposal 状态机、洛书三概念、Restore/Merge 分离 |
-| **10（终审）** | **框架定稿** | **大师裁定：框架无异议，P2 延后；v1.4 为实现依据** |
+| **10（终审）** | **框架定稿** | **大师裁定：框架无异议，P2 延后** |
+| **11（开发前收敛）** | **五项专项（P0×3/P1×2）** | **Minimize 受控归档+MINIMIZED 状态 / 完整行为矩阵(含不可达组合与 8 错误码) / Purge Ledger 账本方案 / RAW 三级背压 / 洛书节点级 Scope 契约** |
 
 ---
 
