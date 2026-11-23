@@ -1,7 +1,7 @@
 # 洛书 Luoshu · 开放记忆交换格式 v0.3
 
 > 河图 HeTu 的数据契约——"数据在用户手里"的载体。任何第三方工具可读取；导入幂等。
-> v0.3：与主规格 v1.4（收敛版）对齐——节点级 Scope 契约 / Purge Ledger（含 content_hash）/ Minimize 归档字段 / Restore-Merge 共用权限管线。
+> v0.3（与主规格 v1.4 收敛定稿同基线）：——节点级 Scope 契约 / Purge Ledger（含 content_hash）/ Minimize 归档字段 / Restore-Merge 共用权限管线。
 
 **节点级是权威数据，文件级仅传输容器；冲突节点级胜出。**
 
@@ -22,12 +22,12 @@
 ```json
 {
   "format": "luoshu",
-  "version": "0.2",
+  "version": "0.3",
   "exported_at": "2026-11-23T09:00:00+08:00",
   "exporter": { "product": "hetu", "version": "0.1.0" },
   "owner_id": "default",
-  "purge_markers": [
-    { "node_id": "mem_X", "purge_seq": 42, "purged_at": "..." }
+  "purge_ledger": [
+    { "purge_seq": 42, "node_id": "mem_X", "content_hash": "sha256:...", "timestamp": "...", "reason_category": "user-request" }
   ]
 }
 ```
@@ -39,7 +39,7 @@
   "id": "mem_01ABC",
   "kind": "memory | entity | annotation | persona_block",
   "version_state": "current | superseded",
-  "content_state": "full | stub",
+  "content_state": "full | minimized | stub | tombstone",
   "content_ref": "blobs/0001.txt",
   "stub_summary": "一句话摘要（content_state=stub 时必有）",
   "modality": "text",
@@ -91,7 +91,7 @@
 
 - **导出剔除集**：TOMBSTONE / PURGED 节点与 RAW 层永不出现
 - **SUPERSEDED/STUB**：导出 stub_summary 与全部关联边（时间回溯依赖）
-- **Purge Marker**：随每次导出携带全量；**导入先应用 Marker 再导普通节点**
+- **Purge Ledger（导出投影，原 Purge Marker）**：随每次导出携带全量；**导入先应用 Ledger 再导普通节点**
 - **私有内容**：默认仅导出共享事实；per-agent 注解/persona 需显式授权且单独文件
 - **派生链不重复计数**：origin=session-digest / reflection 的节点不计入"独立来源"佐证
 - **Restore vs Merge**：Restore 不重跑淘汰（原样恢复）；Merge 按当前库执行确定性淘汰；无法自动解决的冲突生成报告；**两者共用同一套节点级导入权限验证管线**
