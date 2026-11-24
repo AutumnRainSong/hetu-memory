@@ -103,9 +103,12 @@
       },
       "allOf": [
         { "if": { "properties": { "content_state": { "const": "stub" } } },
-          "then": { "required": ["stub_summary"] } },
+          "then": { "required": ["stub_summary"], "properties": { "stub_summary": { "type": "string", "minLength": 1 } } } },
         { "if": { "properties": { "content_state": { "const": "minimized" } } },
-          "then": { "required": ["minimized_blob_ref", "minimized_blob_hash", "stub_summary"] } },
+          "then": { "required": ["minimized_blob_ref", "minimized_blob_hash", "stub_summary"],
+                    "properties": { "stub_summary": { "type": "string", "minLength": 1 },
+                                    "minimized_blob_ref": { "type": "string", "pattern": "^archive/.+" },
+                                    "minimized_blob_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" } } } },
         { "if": { "properties": { "content_state": { "const": "full" } } },
           "then": { "required": ["content_ref"] } }
       ],
