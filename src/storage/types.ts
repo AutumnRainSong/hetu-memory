@@ -7,6 +7,7 @@ export type ContentState = 'FULL' | 'MINIMIZED' | 'STUB' | 'TOMBSTONE';
 /** PURGED 仅在 Purge Ledger 中记录，节点物理不存在 */
 export type ContentStateIncludingPurged = ContentState | 'PURGED';
 
+/** NodeId = 逻辑记忆身份（跨版本不变）；RevisionId = 具体内容版本 */
 export type NodeId = string;
 export type RevisionId = string;
 export type ContentHash = string; // sha256:...
@@ -50,7 +51,7 @@ export interface MemoryNode {
   valid_from: string;
   valid_until: string | null;
   ingested_at: string;
-  superseded_by: NodeId | null;
+  superseded_by: RevisionId | null; // 指向被替代的具体 revision（M1-A：NodeId/RevisionId 分离）
 }
 
 export interface Edge {
