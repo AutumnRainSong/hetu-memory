@@ -1,8 +1,9 @@
 /** Migration 运行器：按版本号顺序回放未应用的 migration（幂等）。 */
 import { DatabaseSync } from './sqlite.ts';
 import { migration as m001 } from './migrations/001_init.ts';
+import { migration as m002 } from './migrations/002_scope_revision.ts';
 
-const MIGRATIONS = [m001];
+const MIGRATIONS = [m001, m002];
 
 export function runMigrations(db: InstanceType<typeof DatabaseSync>): { applied: number[] } {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
