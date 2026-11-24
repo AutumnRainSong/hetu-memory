@@ -34,12 +34,22 @@ describe('migration 001', () => {
   it('链尾唯一性：同 node_id 只允许一个 CURRENT（部分唯一索引）', () => {
     runMigrations(db);
     const ins = db.prepare(`INSERT INTO nodes(node_id,revision_id,revision_sequence,content_hash,
-      version_state,content_state,modality,confidence,provenance,valid_from,ingested_at)
-      VALUES(?,?,?,?,'CURRENT','FULL','text',0.6,'{}','2026-01-01','2026-01-01')`);
+      version_state,content_state,modality,confidence,provenance,owner_id,layer,project_id,visibility,
+      shared_with,valid_from,ingested_at)
+      VALUES(?,?,?,?,'CURRENT','FULL','text',0.6,'{}','user-default','project','p1','project_agents','[]','2026-01-01','2026-01-01')`);
     ins.run('n1', 'r1', 1, 'sha256:a');
-    expect(() => ins.run('n1', 'r2', 2, 'sha256:b')).toThrow(); // CURRENT 冲突
-    db.prepare("UPDATE nodes SET version_state='SUPERSEDED', superseded_by='r3' WHERE revision_id='r1'").run();
-    expect(() => ins.run('n1', 'r3', 3, 'sha256:c')).not.toThrow();
+    expect(() => ins.run('n1', 'r2', 2, 'sha256:b')).toThrow(); // CURRENT 冲突（idx_nodes_current）
+    // supersede 收敛流程：新 revision 以 SUPERSEDED 插入（占位）→ 旧链尾翻转为 SUPERSEDED
+    // 并指向新 revision → 新 revision 升为 CURRENT（T-B-02 存储层 CAS 单事务完成）
+    const insS = db.prepare(`INSERT INTO nodes(node_id,revision_id,revision_sequence,content_hash,
+      version_state,content_state,modality,confidence,provenance,owner_id,layer,project_id,visibility,
+      shared_with,valid_from,ingested_at)
+      VALUES(?,?,?,?,'SUPERSEDED','FULL','text',0.6,'{}','user-default','project','p1','project_agents','[]','2026-01-01','2026-01-01')`);
+    insS.run('n1', 'r2', 2, 'sha256:b');
+    db.prepare("UPDATE nodes SET version_state='SUPERSEDED', superseded_by_revision='r2' WHERE revision_id='r1'").run();
+    db.prepare("UPDATE nodes SET version_state='CURRENT' WHERE revision_id='r2'").run();
+    const cur = db.prepare("SELECT revision_id FROM nodes WHERE node_id='n1' AND version_state='CURRENT'").get();
+    expect((cur as { revision_id: string }).revision_id).toBe('r2');
   });
 
   it('Purge Ledger 追加并按 content_hash 检索', () => {
