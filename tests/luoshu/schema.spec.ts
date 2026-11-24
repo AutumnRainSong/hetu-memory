@@ -11,6 +11,7 @@ describe('luoshu-v0.3 sample', () => {
   it('正式样例通过校验器', () => {
     const out = execSync(`${VALIDATOR} schemas/luoshu-v0.3.sample.json`, { encoding: 'utf8' });
     expect(out).toContain('洛书包校验通过');
+    expect(out).toContain('1 ledger entries');
   });
 
   it('PRIVATE_LEAK 样例被全文件拒绝', () => {
