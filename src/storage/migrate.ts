@@ -4,7 +4,7 @@ import { migration as m001 } from './migrations/001_init.ts';
 
 const MIGRATIONS = [m001];
 
-export function runMigrations(db: DatabaseSync): { applied: number[] } {
+export function runMigrations(db: InstanceType<typeof DatabaseSync>): { applied: number[] } {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL,
     applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))`);
