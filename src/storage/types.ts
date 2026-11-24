@@ -69,6 +69,7 @@ export interface OutboxEntry {
   payload?: unknown;
 }
 
+export type ErrorCodeName = 'STATE_CONFLICT' | 'PURGED_FINAL' | 'STUB_IMMUTABLE' | 'ARCHIVE_MISSING' | 'INVALID_STATE' | 'QUOTA_HARD_LIMIT' | 'PERMISSION_DENIED' | 'WRITE_PAUSED' | 'MARKER_CONFLICT' | 'CAS_CONFLICT';
 export type TxResult =
   | { ok: true; revision_id: RevisionId }
-  | { ok: false; error: keyof typeof ErrorCodes; currentRevision?: RevisionId };
+  | { ok: false; error: ErrorCodeName; currentRevision?: RevisionId };
