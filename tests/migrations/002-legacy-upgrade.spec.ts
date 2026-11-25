@@ -62,7 +62,7 @@ describe('Migration 002 Rev3 — 旧数据库升级', () => {
     insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1-1' });
     insertLegacy(db, { node_id: 'mem-2', revision_id: 'rev-2-1' });
 
-    const { applied } = runMigrations(db, { legacyOwnerId: 'user-legacy' });
+    const { applied } = runMigrations(db, { legacyOwnerId: 'user-legacy', acceptDefaultScopeMapping: true });
     expect(applied).toContain(2);
 
     expect((db.prepare('SELECT COUNT(*) c FROM nodes').get() as { c: number }).c).toBe(2);
@@ -81,7 +81,7 @@ describe('Migration 002 Rev3 — 旧数据库升级', () => {
     });
     insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1-2', sequence: 2 });
 
-    runMigrations(db, { legacyOwnerId: 'user-legacy' });
+    runMigrations(db, { legacyOwnerId: 'user-legacy', acceptDefaultScopeMapping: true });
 
     const v1 = getRevision(db, 'rev-1-1');
     expect(v1.superseded_by_revision).toBe('rev-1-2');
@@ -94,7 +94,7 @@ describe('Migration 002 Rev3 — 旧数据库升级', () => {
 
     let err: Error | null = null;
     try {
-      runMigrations(db, { legacyOwnerId: 'user-legacy' });
+      runMigrations(db, { legacyOwnerId: 'user-legacy', acceptDefaultScopeMapping: true });
     } catch (e) {
       err = e as Error;
     }
@@ -112,7 +112,7 @@ describe('Migration 002 Rev3 — 旧数据库升级', () => {
 
     let err: Error | null = null;
     try {
-      runMigrations(db, { legacyOwnerId: 'user-legacy' });
+      runMigrations(db, { legacyOwnerId: 'user-legacy', acceptDefaultScopeMapping: true });
     } catch (e) {
       err = e as Error;
     }
@@ -132,7 +132,8 @@ describe('Migration 002 Rev3 — 旧数据库升级', () => {
     }
     expect(err).not.toBeNull();
     expect(err!.message).toMatch(/MIGRATION_ABORTED/);
-    expect(err!.message).toMatch(/owner/);
+    // 新的双重门禁：先拦「缺少显式 Scope 映射」，同样阻止擅自归属
+    expect(err!.message).toMatch(/缺少显式 Scope 映射/);
     expect(err!.message).toMatch(/rev-1-1/); // 待处理清单
 
     // 迁移未应用，未静默分配 owner
