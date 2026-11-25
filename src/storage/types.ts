@@ -7,10 +7,25 @@ export type ContentState = 'FULL' | 'MINIMIZED' | 'STUB' | 'TOMBSTONE';
 /** PURGED 仅在 Purge Ledger 中记录，节点物理不存在 */
 export type ContentStateIncludingPurged = ContentState | 'PURGED';
 
-/** NodeId = 逻辑记忆身份（跨版本不变）；RevisionId = 具体内容版本 */
-export type NodeId = string;
-export type RevisionId = string;
-export type ContentHash = string; // sha256:...
+/** Branded ID：编译期区分「逻辑记忆身份」与「具体版本」，防止混用（任务 B1）。
+ *  NodeId = 逻辑记忆身份（跨版本不变）；RevisionId = 具体内容版本。
+ */
+declare const nodeIdBrand: unique symbol;
+declare const revisionIdBrand: unique symbol;
+
+export type NodeId = string & { readonly [nodeIdBrand]: true };
+export type RevisionId = string & { readonly [revisionIdBrand]: true };
+
+/** 构造与解包（边界处唯一允许 string ↔ branded 转换的地方） */
+export const asNodeId = (s: string): NodeId => s as NodeId;
+export const asRevisionId = (s: string): RevisionId => s as RevisionId;
+export const nodeIdStr = (id: NodeId): string => id;
+export const revisionIdStr = (id: RevisionId): string => id;
+
+/** 内容哈希（sha256:...） */
+declare const contentHashBrand: unique symbol;
+export type ContentHash = string & { readonly [contentHashBrand]: true };
+export const asContentHash = (s: string): ContentHash => s as ContentHash;
 
 export interface Scope {
   owner_id: string;
@@ -54,14 +69,24 @@ export interface MemoryNode {
   superseded_by: RevisionId | null; // 指向被替代的具体 revision（M1-A：NodeId/RevisionId 分离）
 }
 
-export interface Edge {
-  type: 'cooccur' | 'supersedes' | 'annotation' | 'link';
-  link_class?: 'pinned' | 'explicit' | 'inferred';
-  from: NodeId;
-  to: NodeId;
-  weight: number;
-  created_at: string;
-}
+/** 边为判别联合：普通关系边引用 NodeId（逻辑记忆身份），
+ *  supersedes 版本替代边引用 RevisionId（具体版本）——语义不可混用（M1-A 任务 E）。 */
+export type Edge =
+  | {
+      type: 'cooccur' | 'annotation' | 'link';
+      link_class?: 'pinned' | 'explicit' | 'inferred';
+      from: NodeId;
+      to: NodeId;
+      weight: number;
+      created_at: string;
+    }
+  | {
+      type: 'supersedes';
+      from: RevisionId;   // 新 revision
+      to: RevisionId;     // 被替代的旧 revision
+      weight: number;
+      created_at: string;
+    };
 
 export interface OutboxEntry {
   kind: 'digest' | 'index' | 'gc';
