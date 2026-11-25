@@ -31,7 +31,15 @@
 9. **数据正确性不依赖智能反思**。反思关闭，写入/读取/权限/生命周期照常正确。
 10. **导入不改变数据的真实含义**。Restore 保留原结构（重放淘汰是错误），Merge 才做冲突检查。
 
-## 当前进度与下一步
+## 当前进度（M1-A Rev3）
+
+- Migration 002 Rev3：Scope 真实 NOT NULL + 字段关系约束、旧数据安全迁移（歧义即中止并列出）、
+  NULL 安全不可变触发器、Down 真实可回滚、Revision 引用/自引用/环检测
+- 测试：60 个测试全绿（7 文件），含旧库升级、Up/Down 循环、NULL 绕过、边 ID 语义
+- 旧数据兼容策略：`docs/MIGRATION-NOTES-002.md`
+- 下一步 M1-B：SqliteStorageProvider / StorageTx（CAS、事务原子性、Outbox）
+
+## 原始进度与下一步
 
 **已定稿**：四层架构 / 五类归属（User Identity / Agent Persona / Global / Project / Private Annotation）/ 双维度状态机（版本 CURRENT/SUPERSEDED × 内容 FULL/STUB/TOMBSTONE/PURGED）/ 8×状态组合行为矩阵 / 删除三操作（Minimize/Forget/Purge）/ Purge Marker / 权限前置硬过滤 / Embedding Worker / Writer 队列+Outbox / top-K 确定性淘汰 / 性能验收标准（Recall P95 ≤150ms 等）。
 
