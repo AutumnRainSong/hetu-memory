@@ -19,6 +19,8 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
+      - name: Dependency audit (fail on high/critical)
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org/
       - run: npm run lint
       - run: npm run build
       - run: npm test
