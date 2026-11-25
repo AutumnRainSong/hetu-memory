@@ -25,6 +25,7 @@ function inspectLegacy(db: any): {
   ambiguous: string[];
   dangling: string[];
   nodeIdShaped: string[];
+  cycles: string[];
 } {
   const rows = db
     .prepare('SELECT node_id, revision_id, superseded_by FROM nodes WHERE superseded_by IS NOT NULL')
@@ -47,14 +48,64 @@ function inspectLegacy(db: any): {
       dangling.push(`${r.node_id}/${r.revision_id} -> superseded_by=${r.superseded_by}`);
     }
   }
-  return { rows, ambiguous, dangling, nodeIdShaped };
+  // 环检测（任务 A3）：沿旧 superseded_by 链遍历，回到起点即成环
+  const cycles: string[] = [];
+  const chainMap = new Map<string, string>();
+  for (const r of db
+    .prepare('SELECT revision_id, superseded_by FROM nodes WHERE superseded_by IS NOT NULL')
+    .all() as { revision_id: string; superseded_by: string }[]) {
+    chainMap.set(r.revision_id, r.superseded_by);
+  }
+  for (const start of chainMap.keys()) {
+    const seen = new Set<string>();
+    let cur: string | undefined = start;
+    while (cur && chainMap.has(cur)) {
+      if (seen.has(cur)) {
+        cycles.push([...seen, cur].join(' -> '));
+        break;
+      }
+      seen.add(cur);
+      cur = chainMap.get(cur);
+    }
+  }
+
+  return { rows, ambiguous, dangling, nodeIdShaped, cycles };
+}
+
+export interface LegacyScopeEntry {
+  layer: 'user_identity' | 'agent_persona' | 'global' | 'project' | 'private_annotation';
+  project_id?: string | null;
+  agent_id?: string | null;
+  visibility: 'owner' | 'project_agents' | 'all_agents' | 'shared_list';
+  shared_with?: string[];
 }
 
 export const migration = {
   version: 2,
   name: 'scope-persistence-and-revision-separation',
-  up: (db: any, opts: { legacyOwnerId?: string } = {}) => {
+  up: (
+    db: any,
+    opts: {
+      legacyOwnerId?: string;
+      /** Legacy Scope Mapping Manifest：node_id → 显式归属映射（任务 A2）。
+       *  未提供时不得擅自推断旧记忆归属；仅当全部旧数据可由默认策略安全归类
+       *  （即数据库为空，或调用方显式声明 acceptDefaultScopeMapping=true）时才继续。 */
+      legacyScopeManifest?: Record<string, LegacyScopeEntry>;
+      /** 显式声明接受默认映射（全部归入 project/default-project）。默认 false。 */
+      acceptDefaultScopeMapping?: boolean;
+      /** Dry run：只做校验与报告，不修改数据库。 */
+      dryRun?: boolean;
+    } = {}
+  ) => {
     const legacy = inspectLegacy(db);
+
+    // ── 任务 A3：历史 Revision 环必须中止（不能依赖迁移后的 UPDATE 触发器）──
+    if (legacy.cycles.length) {
+      throw new Error(
+        `MIGRATION_ABORTED: legacy supersede chain contains cycle(s):\n  ${legacy.cycles.join('\n  ')}\n` +
+          `修复方式：人工断开环（将其中一条 superseded_by 置 NULL 或指向正确版本）后重跑迁移。`
+      );
+    }
 
     // ── 任务 B：歧义/悬空历史数据必须报告并中止，绝不静默丢弃或错误转换 ──
     if (legacy.ambiguous.length || legacy.dangling.length) {
@@ -78,7 +129,33 @@ export const migration = {
       db.prepare('SELECT COUNT(*) AS c FROM nodes').get() as { c: number }
     ).c;
 
-    // ── 任务 A：旧节点 Scope 回填必须显式指定 owner，不得擅自分配 ──
+    // ── 任务 A2：旧数据归属必须来自显式映射，不得默认全部塞进 project ──
+    const manifest = opts.legacyScopeManifest ?? {};
+    if (nodeCount > 0) {
+      const revIds: string[] = (
+        db.prepare('SELECT revision_id FROM nodes').all() as { revision_id: string }[]
+      ).map(r => r.revision_id);
+      const unmapped = revIds.filter(id => !(id in manifest));
+      if (unmapped.length > 0 && !opts.acceptDefaultScopeMapping) {
+        if (opts.dryRun) {
+          // Dry run：只报告，不修改数据库
+          throw new Error(
+            `DRY_RUN_REPORT: 共 ${nodeCount} 条旧记忆，其中 ${unmapped.length} 条没有显式 Scope 映射。\n` +
+              `未经映射不得写入共享空间。请提供 legacyScopeManifest（revision_id → {layer, visibility, ...}）\n` +
+              `或显式传 acceptDefaultScopeMapping=true 表示同意全部归入 project/default-project。\n` +
+              `待映射记录（最多 20 条）：\n  ${unmapped.slice(0, 20).join('\n  ')}`
+          );
+        }
+        throw new Error(
+          `MIGRATION_ABORTED: ${unmapped.length}/${nodeCount} 条旧记忆缺少显式 Scope 映射。\n` +
+            `旧数据可能分属 user_identity / agent_persona / global / project / private_annotation，\n` +
+            `不能因为迁移时缺少信息就一律归入默认项目。请提供 legacyScopeManifest，\n` +
+            `或显式传 acceptDefaultScopeMapping=true。\n` +
+            `待映射记录（最多 20 条）：\n  ${unmapped.slice(0, 20).join('\n  ')}`
+        );
+      }
+    }
+
     if (nodeCount > 0 && !opts.legacyOwnerId) {
       const sample = db
         .prepare('SELECT node_id, revision_id FROM nodes LIMIT 20')
@@ -137,7 +214,8 @@ CREATE TABLE nodes_rev3 (
     const rows = db
       .prepare(
         `SELECT node_id, revision_id, revision_sequence, content_hash, version_state,
-                content_state, content_ref, stub_summary, modality, confidence, provenance,
+                content_state, content_ref, stub_summary, minimized_blob_ref, minimized_blob_hash,
+                modality, confidence, provenance,
                 valid_from, valid_until, ingested_at, superseded_by
          FROM nodes`
       )
@@ -149,9 +227,19 @@ CREATE TABLE nodes_rev3 (
         modality, confidence, provenance, valid_from, valid_until, ingested_at,
         superseded_by, superseded_by_revision,
         owner_id, layer, project_id, agent_id, visibility, shared_with)
-       VALUES(?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,NULL,?,?,?,?,NULL,?,?)`
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`
     );
     for (const r of rows) {
+      const mapped: LegacyScopeEntry | undefined = manifest[r.revision_id];
+      const m: LegacyScopeEntry =
+        mapped ??
+        ({
+          layer: 'project',
+          project_id: 'default-project',
+          agent_id: null,
+          visibility: 'project_agents',
+          shared_with: [],
+        } as LegacyScopeEntry);
       insert.run(
         r.node_id,
         r.revision_id,
@@ -161,6 +249,8 @@ CREATE TABLE nodes_rev3 (
         r.content_state,
         r.content_ref ?? null,
         r.stub_summary ?? null,
+        r.minimized_blob_ref ?? null,
+        r.minimized_blob_hash ?? null,
         r.modality,
         r.confidence,
         r.provenance,
@@ -169,10 +259,11 @@ CREATE TABLE nodes_rev3 (
         r.ingested_at,
         r.superseded_by ?? null, // 已验证可无歧义转换 → 迁入新列
         legacyOwner ?? 'default',
-        'project',
-        'default-project',
-        'project_agents',
-        '[]'
+        m.layer,
+        m.project_id ?? null,
+        m.agent_id ?? null,
+        m.visibility,
+        JSON.stringify(m.shared_with ?? [])
       );
     }
 
