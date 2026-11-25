@@ -50,7 +50,7 @@ describe('Migration 002 Rev3 — 回滚（任务 C）', () => {
     insertNode(db, { node_id: 'n1', revision_id: 'r1' });
     rollbackTo(db, 1);
     // 回滚后数据回到 001 结构（无 scope 列）→ 再次 Up 必须显式指定 legacy owner
-    const { applied } = runMigrations(db, { legacyOwnerId: 'user-legacy' });
+    const { applied } = runMigrations(db, { legacyOwnerId: 'user-legacy', acceptDefaultScopeMapping: true });
     expect(applied).toContain(2);
 
     // 重新施加的约束生效
