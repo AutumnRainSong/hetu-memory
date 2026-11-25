@@ -31,7 +31,18 @@
 9. **数据正确性不依赖智能反思**。反思关闭，写入/读取/权限/生命周期照常正确。
 10. **导入不改变数据的真实含义**。Restore 保留原结构（重放淘汰是错误），Merge 才做冲突检查。
 
-## 当前进度（M1-A Rev3）
+## 当前真实状态（2026-11-25）
+
+- **当前 commit**：`29c4d2b` + Rev4 修订（待推送）
+- **测试**：11 文件 / **99 项全绿**；lint ✅ tsc ✅ 依赖审计 **0 漏洞**
+- **M1-A Rev4 已交付待独立复审**：
+  - A1 MINIMIZED 归档字段保全 · A2 旧数据显式映射（manifest + dryRun）· A3 迁移前环检测
+  - B1 Branded ID（NodeId/RevisionId/ContentHash）· B2 Edge 判别联合 · B3 Scope 五类契约 14 用例 · B4 洛书语义校验
+  - 依赖治理：移除未使用的 zod，vitest 升 5.x → 0 漏洞；CI 增加审计门禁
+- **尚未实现**：StorageProvider 真实实现、CAS/事务/Outbox、Remember/Recall 业务链、权限执行链
+- **下一阶段启动条件**：M1-A Rev4 通过独立复审 → 进入 M1-B Storage Engine
+
+## 历史进度（M1-A Rev3）
 
 - Migration 002 Rev3：Scope 真实 NOT NULL + 字段关系约束、旧数据安全迁移（歧义即中止并列出）、
   NULL 安全不可变触发器、Down 真实可回滚、Revision 引用/自引用/环检测
