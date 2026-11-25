@@ -1,4 +1,10 @@
 name: CI
+
+# 同分支连续 push 时自动取消过时的中间 run，只保留最新一次（防刷屏）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
