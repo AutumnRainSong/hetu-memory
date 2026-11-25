@@ -1,161 +1,329 @@
-/** Migration 002（修订版 2）：Scope 持久化 + RevisionId 分离 + 旧数据迁移与校验
- *  按《M1-A 数据模型修订任务书》任务 A-F 重写：
- *  - 旧数据 Scope 回填：无法安全推断 owner → 迁移明确失败并列出待处理记录
- *  - superseded_by（旧 NodeId 语义）→ superseded_by_revision（RevisionId 语义）：显式检测，歧义即中止
- *  - 必需字段非空约束 + shared_with JSON 合法性校验
- *  - Down 脚本按真实触发器名删除
- *  - NULL 安全的不可变触发器（IS NOT），字段级不变量明确
+/** Migration 002（Rev3）：Scope 持久化 + RevisionId 分离 + 旧数据安全迁移
+ *
+ * 按《M1-A 数据模型修订任务书 Rev3》任务 A-F 实现：
+ *  - 任务 A：旧节点 Scope 回填；无法安全推断 owner → 迁移明确中止并列出待处理记录
+ *  - 任务 B：superseded_by 旧值（NodeId/RevisionId 混用）显式检测；歧义或悬空 → 中止并列出
+ *  - 任务 C：Down 按真实触发器名删除；执行 Down 后 001 结构可用，可再次 Up
+ *  - 任务 D：不可变触发器用 NULL 安全比较（IS NOT）；字段级不变量显式定义
+ *  - 任务 E：id 语义分离（node_id = 逻辑身份，revision_id = 具体版本）
+ *  - 任务 F：迁移层只负责引用完整性 / 序号唯一 / 自引用与环检测；
+ *            完整 CAS（恰好一个 CURRENT、事务原子性）由 StorageTx 负责（T-B-02）
+ *
+ * 做法：重建 nodes 表以施加真实 NOT NULL / CHECK 约束（SQLite 无法 ALTER 加 NOT NULL）。
+ * 旧数据在复制前完成校验，任一条无法安全转换即整体中止，不留半迁移状态。
  */
+
+interface LegacyRow {
+  node_id: string;
+  revision_id: string;
+  superseded_by: string | null;
+}
+
+/** 旧数据预校验：返回问题清单（空 = 可安全迁移） */
+function inspectLegacy(db: any): {
+  rows: LegacyRow[];
+  ambiguous: string[];
+  dangling: string[];
+  nodeIdShaped: string[];
+} {
+  const rows = db
+    .prepare('SELECT node_id, revision_id, superseded_by FROM nodes WHERE superseded_by IS NOT NULL')
+    .all() as LegacyRow[];
+  const ambiguous: string[] = [];
+  const dangling: string[] = [];
+  const nodeIdShaped: string[] = [];
+
+  for (const r of rows) {
+    const asRevision = db
+      .prepare('SELECT 1 FROM nodes WHERE node_id=? AND revision_id=?')
+      .get(r.node_id, r.superseded_by as string);
+    if (asRevision) continue; // 同 node_id 下确有该 revision → 可无歧义迁移
+    const asNodeId = db.prepare('SELECT 1 FROM nodes WHERE node_id=?').get(r.superseded_by as string);
+    if (asNodeId) {
+      // 旧值实际是 NodeId（跨版本歧义）：无法判断它指向哪个 revision
+      ambiguous.push(`${r.node_id}/${r.revision_id} -> superseded_by=${r.superseded_by}`);
+      nodeIdShaped.push(r.superseded_by as string);
+    } else {
+      dangling.push(`${r.node_id}/${r.revision_id} -> superseded_by=${r.superseded_by}`);
+    }
+  }
+  return { rows, ambiguous, dangling, nodeIdShaped };
+}
+
 export const migration = {
   version: 2,
   name: 'scope-persistence-and-revision-separation',
-  up: `
--- ============ 阶段 1：加列（允许 NULL，先加列后回填） ============
-ALTER TABLE nodes ADD COLUMN owner_id TEXT;
-ALTER TABLE nodes ADD COLUMN layer TEXT;
-ALTER TABLE nodes ADD COLUMN project_id TEXT;
-ALTER TABLE nodes ADD COLUMN agent_id TEXT;
-ALTER TABLE nodes ADD COLUMN visibility TEXT;
-ALTER TABLE nodes ADD COLUMN shared_with TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE nodes ADD COLUMN superseded_by_revision TEXT;
+  up: (db: any, opts: { legacyOwnerId?: string } = {}) => {
+    const legacy = inspectLegacy(db);
 
--- ============ 阶段 2：旧数据回填与校验 ============
+    // ── 任务 B：歧义/悬空历史数据必须报告并中止，绝不静默丢弃或错误转换 ──
+    if (legacy.ambiguous.length || legacy.dangling.length) {
+      const detail = [
+        legacy.ambiguous.length
+          ? `[AMBIGUOUS] 旧 superseded_by 存的是 NodeId（无法确定具体 revision）：\n  ${legacy.ambiguous.join('\n  ')}`
+          : '',
+        legacy.dangling.length
+          ? `[DANGLING] 旧 superseded_by 无法匹配任何同 node_id 的 revision_id：\n  ${legacy.dangling.join('\n  ')}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+      throw new Error(
+        `MIGRATION_ABORTED: migration 002 cannot safely convert legacy superseded_by values.\n${detail}\n` +
+          `修复方式：人工确认每条记录应指向的 revision_id（或置 NULL），修正后重跑迁移。`
+      );
+    }
 
--- 2a. shared_with JSON 合法性校验：非合法 JSON 数组 → 迁移失败
-CREATE TRIGGER trg_m002_sharedwith_validate
-BEFORE UPDATE ON nodes
-WHEN json_valid(NEW.shared_with)=0 OR json_type(NEW.shared_with)!='array'
-BEGIN
-  SELECT RAISE(ABORT, 'MIGRATION_FAIL: shared_with is not a valid JSON array — manual fix required before re-running migration 002');
-END;
+    const nodeCount = (
+      db.prepare('SELECT COUNT(*) AS c FROM nodes').get() as { c: number }
+    ).c;
 
--- 2b. superseded_by 历史数据迁移（旧列语义混用检测）：
---     旧值与同 node_id 的某 revision_id 匹配 → 迁入 superseded_by_revision
-UPDATE nodes SET superseded_by_revision = superseded_by
-WHERE superseded_by IS NOT NULL
-  AND EXISTS (SELECT 1 FROM nodes AS other
-              WHERE other.node_id = nodes.node_id
-                AND other.revision_id = nodes.superseded_by);
+    // ── 任务 A：旧节点 Scope 回填必须显式指定 owner，不得擅自分配 ──
+    if (nodeCount > 0 && !opts.legacyOwnerId) {
+      const sample = db
+        .prepare('SELECT node_id, revision_id FROM nodes LIMIT 20')
+        .all() as { node_id: string; revision_id: string }[];
+      throw new Error(
+        `MIGRATION_ABORTED: 数据库已有 ${nodeCount} 条记忆记录，但未提供旧数据归属 owner。\n` +
+          `迁移不会擅自把旧记忆归入某个用户。请显式提供 owner（MIGRATIONS 选项 legacyOwnerId / 环境变量 HETU_LEGACY_OWNER）。\n` +
+          `待处理记录（最多 20 条）：\n  ${sample.map(r => r.revision_id).join('\n  ')}`
+      );
+    }
+    const legacyOwner = opts.legacyOwnerId ?? null;
 
--- 残留检测：仍有 superseded_by 非 NULL 但 superseded_by_revision 为 NULL 的行
--- （NodeId 歧义 / 悬空引用）→ 触发迁移失败，列出待处理记录
-CREATE TRIGGER trg_m002_superseded_leftover
-BEFORE UPDATE ON nodes
-WHEN EXISTS (
-  SELECT 1 FROM nodes AS n
-  WHERE n.superseded_by IS NOT NULL AND n.superseded_by_revision IS NULL)
-BEGIN
-  SELECT RAISE(ABORT, 'MIGRATION_FAIL: unresolved legacy superseded_by values detected — inspect: SELECT node_id,revision_id,superseded_by FROM nodes WHERE superseded_by IS NOT NULL AND superseded_by_revision IS NULL');
-END;
+    // ── 重建表以施加真实 NOT NULL / CHECK 约束 ──
+    db.exec(`
+CREATE TABLE nodes_rev3 (
+  node_id TEXT NOT NULL,
+  revision_id TEXT PRIMARY KEY,
+  revision_sequence INTEGER NOT NULL CHECK (revision_sequence >= 1),
+  content_hash TEXT NOT NULL,
+  version_state TEXT NOT NULL CHECK (version_state IN ('CURRENT','SUPERSEDED')),
+  content_state TEXT NOT NULL CHECK (content_state IN ('FULL','MINIMIZED','STUB','TOMBSTONE')),
+  content_ref TEXT,
+  stub_summary TEXT,
+  minimized_blob_ref TEXT,
+  minimized_blob_hash TEXT,
+  modality TEXT NOT NULL DEFAULT 'text',
+  confidence REAL NOT NULL DEFAULT 0.6,
+  provenance TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT,
+  ingested_at TEXT NOT NULL,
 
--- Scope 回填（MVP 单用户基线：owner_id='default'；layer=project；visibility=project_agents）
--- 无法推断 owner 的记录 → 由 trg_m002_scope_backfill_check 拦截并要求人工处理
-CREATE TRIGGER trg_m002_scope_backfill_check
-BEFORE UPDATE ON nodes
-WHEN EXISTS (
-  SELECT 1 FROM nodes AS n
-  WHERE n.owner_id IS NULL OR n.layer IS NULL OR n.visibility IS NULL)
-BEGIN
-  SELECT RAISE(ABORT, 'MIGRATION_FAIL: nodes with NULL owner_id/layer/visibility detected — backfill scope explicitly before re-running migration 002. Inspect: SELECT node_id,revision_id FROM nodes WHERE owner_id IS NULL');
-END;
+  /* 已被 superseded_by_revision 取代；保留列仅为兼容读取，禁止再写入 */
+  superseded_by TEXT,
+  superseded_by_revision TEXT,
 
-UPDATE nodes SET owner_id='default', layer='project', visibility='project_agents'
-WHERE owner_id IS NULL;
-UPDATE nodes SET project_id='default-project' WHERE layer='project' AND project_id IS NULL;
--- agent_id：无法从旧数据推断 → 保持 NULL（Global/Project 层允许 NULL）
+  /* --- Scope（任务 A：必需字段真实 NOT NULL）--- */
+  owner_id TEXT NOT NULL,
+  layer TEXT NOT NULL CHECK (layer IN
+    ('user_identity','agent_persona','global','project','private_annotation')),
+  project_id TEXT,
+  agent_id TEXT,
+  visibility TEXT NOT NULL CHECK (visibility IN
+    ('owner','project_agents','all_agents','shared_list')),
+  shared_with TEXT NOT NULL DEFAULT '[]'
+    CHECK (json_valid(shared_with) AND json_type(shared_with)='array'),
 
--- ============ 阶段 3：约束固化（回填完成后） ============
+  /* --- 字段约束关系（任务 A6）--- */
+  CHECK (layer <> 'project' OR project_id IS NOT NULL),
+  CHECK (layer NOT IN ('agent_persona','private_annotation') OR agent_id IS NOT NULL),
+  CHECK (layer <> 'private_annotation' OR visibility = 'owner')
+);
+`);
 
-CREATE TRIGGER trg_nodes_scope_required_ins
-BEFORE INSERT ON nodes
-WHEN NEW.owner_id IS NULL OR NEW.layer IS NULL OR NEW.visibility IS NULL
-  OR (NEW.layer='project' AND NEW.project_id IS NULL)
-  OR (NEW.layer IN ('agent_persona','private_annotation') AND NEW.agent_id IS NULL)
-  OR (NEW.layer='private_annotation' AND NEW.visibility!='owner')
-  OR json_valid(NEW.shared_with)=0 OR json_type(NEW.shared_with)!='array'
-BEGIN
-  SELECT RAISE(ABORT, 'SCOPE_INVALID: scope fields violate the node-level scope contract');
-END;
+    // 复制数据（旧行一律回填显式 owner；superseded_by 迁移为 RevisionId 语义）
+    const rows = db
+      .prepare(
+        `SELECT node_id, revision_id, revision_sequence, content_hash, version_state,
+                content_state, content_ref, stub_summary, modality, confidence, provenance,
+                valid_from, valid_until, ingested_at, superseded_by
+         FROM nodes`
+      )
+      .all() as Record<string, any>[];
 
-CREATE TRIGGER trg_nodes_scope_required_upd
-BEFORE UPDATE ON nodes
-WHEN NEW.owner_id IS NULL OR NEW.layer IS NULL OR NEW.visibility IS NULL
-  OR (NEW.layer='project' AND NEW.project_id IS NULL)
-  OR (NEW.layer IN ('agent_persona','private_annotation') AND NEW.agent_id IS NULL)
-  OR (NEW.layer='private_annotation' AND NEW.visibility!='owner')
-  OR json_valid(NEW.shared_with)=0 OR json_type(NEW.shared_with)!='array'
-BEGIN
-  SELECT RAISE(ABORT, 'SCOPE_INVALID: scope fields violate the node-level scope contract');
-END;
+    const insert = db.prepare(
+      `INSERT INTO nodes_rev3(node_id, revision_id, revision_sequence, content_hash, version_state,
+        content_state, content_ref, stub_summary, minimized_blob_ref, minimized_blob_hash,
+        modality, confidence, provenance, valid_from, valid_until, ingested_at,
+        superseded_by, superseded_by_revision,
+        owner_id, layer, project_id, agent_id, visibility, shared_with)
+       VALUES(?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,NULL,?,?,?,?,NULL,?,?)`
+    );
+    for (const r of rows) {
+      insert.run(
+        r.node_id,
+        r.revision_id,
+        r.revision_sequence,
+        r.content_hash,
+        r.version_state,
+        r.content_state,
+        r.content_ref ?? null,
+        r.stub_summary ?? null,
+        r.modality,
+        r.confidence,
+        r.provenance,
+        r.valid_from,
+        r.valid_until ?? null,
+        r.ingested_at,
+        r.superseded_by ?? null, // 已验证可无歧义转换 → 迁入新列
+        legacyOwner ?? 'default',
+        'project',
+        'default-project',
+        'project_agents',
+        '[]'
+      );
+    }
 
+    db.exec('DROP TABLE nodes');
+    db.exec('ALTER TABLE nodes_rev3 RENAME TO nodes');
+
+    // ── 索引（含 001 的链尾唯一性索引，重建表后必须恢复）──
+    db.exec(`
+CREATE UNIQUE INDEX idx_nodes_current ON nodes(node_id) WHERE version_state='CURRENT';
+CREATE INDEX idx_nodes_chain ON nodes(node_id, revision_sequence);
+CREATE UNIQUE INDEX idx_nodes_revseq ON nodes(node_id, revision_sequence);
 CREATE INDEX idx_nodes_owner ON nodes(owner_id);
 CREATE INDEX idx_nodes_layer_project ON nodes(layer, project_id);
 CREATE INDEX idx_nodes_agent ON nodes(agent_id);
 CREATE INDEX idx_nodes_visibility ON nodes(visibility);
+`);
 
--- RevisionId 分离：引用完整性（INSERT + UPDATE 双触发器）
+    // ── 任务 D：不可变触发器（NULL 安全：IS NOT）+ 字段级不变量 ──
+    // 不可变内容（创建后永不可改）：content_hash / content_ref / ingested_at / provenance
+    //   —— content_ref 从 NULL↔非 NULL 的变更同样被拦截（旧版 `!=` 会被 NULL 绕过）
+    // 生命周期元数据（允许随合法状态迁移变化）：content_state / stub_summary /
+    //   minimized_blob_ref / minimized_blob_hash / superseded_by_revision
+    db.exec(`
+CREATE TRIGGER trg_nodes_immutable_content
+BEFORE UPDATE ON nodes
+WHEN NEW.content_hash IS NOT OLD.content_hash
+  OR NEW.content_ref IS NOT OLD.content_ref
+  OR NEW.ingested_at IS NOT OLD.ingested_at
+  OR NEW.provenance IS NOT OLD.provenance
+BEGIN
+  SELECT RAISE(ABORT, 'MEM_IMMUTABLE: immutable content/provenance fields cannot be modified — create a new revision instead');
+END;
+
+/* 生命周期元数据只在合法状态迁移中变化：MINIMIZED 字段只允许在
+   FULL<->MINIMIZED 之间出现/消失（STUB/TOMBSTONE 不应带归档引用） */
+CREATE TRIGGER trg_nodes_lifecycle_meta_guard
+BEFORE UPDATE ON nodes
+WHEN (NEW.minimized_blob_ref IS NOT NULL OR NEW.minimized_blob_hash IS NOT NULL)
+ AND NEW.content_state NOT IN ('MINIMIZED')
+BEGIN
+  SELECT RAISE(ABORT, 'STATE_CONFLICT: minimized_* fields are only valid while content_state=MINIMIZED');
+END;
+
+/* 废弃列保护：旧 superseded_by 只读，禁止再写入（任务 B5 兼容/废弃策略） */
+CREATE TRIGGER trg_nodes_legacy_superseded_by_readonly
+BEFORE UPDATE OF superseded_by ON nodes
+WHEN NEW.superseded_by IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'MEM_DEPRECATED_FIELD: superseded_by is deprecated — use superseded_by_revision');
+END;
+`);
+
+    // ── RevisionId 分离：引用完整性 + 自引用 + 环（任务 F1-F3）──
+    const refCheck = `
+  SELECT RAISE(ABORT, 'STATE_CONFLICT: superseded_by_revision must reference an existing revision of the same logical memory');
+`;
+    db.exec(`
 CREATE TRIGGER trg_supersede_revision_valid_ins
 BEFORE INSERT ON nodes
 WHEN NEW.superseded_by_revision IS NOT NULL
  AND NOT EXISTS (
-   SELECT 1 FROM nodes
-   WHERE node_id = NEW.node_id AND revision_id = NEW.superseded_by_revision)
-BEGIN
-  SELECT RAISE(ABORT, 'STATE_CONFLICT: superseded_by_revision must reference an existing revision of the same logical memory');
-END;
+   SELECT 1 FROM nodes WHERE node_id = NEW.node_id AND revision_id = NEW.superseded_by_revision)
+BEGIN ${refCheck} END;
 
 CREATE TRIGGER trg_supersede_revision_valid_upd
 BEFORE UPDATE OF superseded_by_revision ON nodes
 WHEN NEW.superseded_by_revision IS NOT NULL
  AND NOT EXISTS (
-   SELECT 1 FROM nodes
-   WHERE node_id = NEW.node_id AND revision_id = NEW.superseded_by_revision)
+   SELECT 1 FROM nodes WHERE node_id = NEW.node_id AND revision_id = NEW.superseded_by_revision)
+BEGIN ${refCheck} END;
+
+/* 自引用禁止 */
+CREATE TRIGGER trg_supersede_no_self_ref
+BEFORE UPDATE OF superseded_by_revision ON nodes
+WHEN NEW.superseded_by_revision IS NOT NULL
+ AND NEW.superseded_by_revision = NEW.revision_id
 BEGIN
-  SELECT RAISE(ABORT, 'STATE_CONFLICT: superseded_by_revision must reference an existing revision of the same logical memory');
+  SELECT RAISE(ABORT, 'STATE_CONFLICT: a revision cannot supersede itself');
 END;
 
--- (node_id, revision_sequence) 唯一
-CREATE UNIQUE INDEX idx_nodes_revseq ON nodes(node_id, revision_sequence);
-
--- 保留 001 的 CURRENT 部分唯一索引（每 node_id 恰一 CURRENT，链尾唯一性存储层强制）
-
--- ============ 阶段 4：不可变触发器（NULL 安全 + 字段级不变量） ============
--- 不可变内容字段：content_hash / content_ref / ingested_at / provenance
--- 生命周期元数据（允许随状态迁移变化）：content_state / stub_summary /
---   minimized_blob_ref / minimized_blob_hash / superseded_by_revision
-CREATE TRIGGER trg_nodes_immutable_content
-BEFORE UPDATE ON nodes
-WHEN NEW.content_state != 'TOMBSTONE'
- AND (NEW.content_hash IS NOT OLD.content_hash
-   OR NEW.content_ref IS NOT OLD.content_ref
-   OR NEW.ingested_at IS NOT OLD.ingested_at
-   OR NEW.provenance IS NOT OLD.provenance)
+/* 环检测：沿 superseded_by_revision 链向前走，若回到自身则成环 */
+CREATE TRIGGER trg_supersede_no_cycle
+BEFORE UPDATE OF superseded_by_revision ON nodes
+WHEN NEW.superseded_by_revision IS NOT NULL
+ AND EXISTS (
+   WITH RECURSIVE chain(rev) AS (
+     SELECT NEW.superseded_by_revision
+     UNION
+     SELECT n.superseded_by_revision
+       FROM nodes n JOIN chain c ON n.revision_id = c.rev
+      WHERE n.superseded_by_revision IS NOT NULL
+   )
+   SELECT 1 FROM chain WHERE rev = NEW.revision_id)
 BEGIN
-  SELECT RAISE(ABORT, 'MEM_IMMUTABLE: immutable content/provenance fields cannot be modified — create a new revision instead');
+  SELECT RAISE(ABORT, 'STATE_CONFLICT: supersede chain would form a cycle');
 END;
-`,
-  down: `
--- Down：按真实触发器名逆序删除（任务 C 修复）
-DROP TRIGGER IF EXISTS trg_nodes_immutable_content;
+`);
+  },
+
+  down: (db: any) => {
+    // ── 任务 C：按真实触发器名逆序删除，再删依赖列 ──
+    db.exec(`
+DROP TRIGGER IF EXISTS trg_supersede_no_cycle;
+DROP TRIGGER IF EXISTS trg_supersede_no_self_ref;
 DROP TRIGGER IF EXISTS trg_supersede_revision_valid_upd;
 DROP TRIGGER IF EXISTS trg_supersede_revision_valid_ins;
-DROP TRIGGER IF EXISTS trg_nodes_scope_required_upd;
-DROP TRIGGER IF EXISTS trg_nodes_scope_required_ins;
-DROP TRIGGER IF EXISTS trg_m002_scope_backfill_check;
-DROP TRIGGER IF EXISTS trg_m002_superseded_leftover;
-DROP TRIGGER IF EXISTS trg_m002_sharedwith_validate;
-DROP INDEX IF EXISTS idx_nodes_revseq;
+DROP TRIGGER IF EXISTS trg_nodes_legacy_superseded_by_readonly;
+DROP TRIGGER IF EXISTS trg_nodes_lifecycle_meta_guard;
+DROP TRIGGER IF EXISTS trg_nodes_immutable_content;
 DROP INDEX IF EXISTS idx_nodes_visibility;
 DROP INDEX IF EXISTS idx_nodes_agent;
 DROP INDEX IF EXISTS idx_nodes_layer_project;
 DROP INDEX IF EXISTS idx_nodes_owner;
--- 先删触发器（引用 superseded_by_revision），再删列
-ALTER TABLE nodes DROP COLUMN superseded_by_revision;
-ALTER TABLE nodes DROP COLUMN shared_with;
-ALTER TABLE nodes DROP COLUMN visibility;
-ALTER TABLE nodes DROP COLUMN agent_id;
-ALTER TABLE nodes DROP COLUMN project_id;
-ALTER TABLE nodes DROP COLUMN layer;
-ALTER TABLE nodes DROP COLUMN owner_id;
-`
+DROP INDEX IF EXISTS idx_nodes_revseq;
+DROP INDEX IF EXISTS idx_nodes_chain;
+DROP INDEX IF EXISTS idx_nodes_current;
+
+/* 还原为 001 结构：去掉 002 引入的列（先删引用它们的触发器，已在上方完成） */
+CREATE TABLE nodes_rev1 (
+  node_id TEXT NOT NULL,
+  revision_id TEXT PRIMARY KEY,
+  revision_sequence INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  version_state TEXT NOT NULL CHECK (version_state IN ('CURRENT','SUPERSEDED')),
+  content_state TEXT NOT NULL CHECK (content_state IN ('FULL','MINIMIZED','STUB','TOMBSTONE')),
+  content_ref TEXT,
+  stub_summary TEXT,
+  minimized_blob_ref TEXT,
+  minimized_blob_hash TEXT,
+  modality TEXT NOT NULL DEFAULT 'text',
+  confidence REAL NOT NULL DEFAULT 0.6,
+  provenance TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT,
+  ingested_at TEXT NOT NULL,
+  superseded_by TEXT
+);
+INSERT INTO nodes_rev1(node_id, revision_id, revision_sequence, content_hash, version_state,
+  content_state, content_ref, stub_summary, minimized_blob_ref, minimized_blob_hash, modality,
+  confidence, provenance, valid_from, valid_until, ingested_at, superseded_by)
+SELECT node_id, revision_id, revision_sequence, content_hash, version_state, content_state,
+  content_ref, stub_summary, minimized_blob_ref, minimized_blob_hash, modality, confidence,
+  provenance, valid_from, valid_until, ingested_at,
+  COALESCE(superseded_by, superseded_by_revision)
+FROM nodes;
+
+DROP TABLE nodes;
+ALTER TABLE nodes_rev1 RENAME TO nodes;
+
+CREATE UNIQUE INDEX idx_nodes_current ON nodes(node_id) WHERE version_state='CURRENT';
+CREATE INDEX idx_nodes_chain ON nodes(node_id, revision_sequence);
+`);
+  },
 };
