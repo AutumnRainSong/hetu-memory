@@ -1,4 +1,4 @@
-# Migration 002 · 旧数据兼容策略说明（Rev3）
+# Migration 002 · 旧数据兼容策略说明（Rev4）
 
 > 交付物 8 / 对应《M1-A 数据模型修订任务书 Rev3》任务 A、B
 > 适用版本：Migration 001（M0 结构）→ Migration 002
@@ -52,6 +52,15 @@ Migration 002 通过**重建 nodes 表**施加真实约束（SQLite 无法用 `A
 `minimized_blob_ref`、`minimized_blob_hash`、`superseded_by_revision`、sensitivity 覆盖层。
 
 守卫：`minimized_*` 只允许在 `content_state='MINIMIZED'` 期间存在，否则 `STATE_CONFLICT`。
+
+## 6.5 Dry Run（Rev4 / P1-C）
+
+`dryRun: true` **在任何条件下都不得修改数据库**（即使 Manifest 完整、即使显式接受默认映射）。
+
+无论是否提供映射、库是否为空，只要 `dryRun=true`，迁移**在写库前统一返回报告并中止**，报告包含：
+总记录数 / 显式映射条数 / 未映射条数 / superseded_by 待转换数（含歧义与悬空）/ 历史环数 / 旧 owner 是否提供 / 待映射记录清单。
+
+Manifest 键语义统一为 **revision_id → LegacyScopeEntry**（不是 node_id）。
 
 ## 6. 本轮未实现（属于 M1-B）
 
