@@ -6,6 +6,7 @@
 import { DatabaseSync } from './sqlite.ts';
 import { migration as m001 } from './migrations/001_init.ts';
 import { migration as m002 } from './migrations/002_scope_revision.ts';
+import { migration as m003 } from './migrations/003_persona_private_edges.ts';
 
 export type Db = InstanceType<typeof DatabaseSync>;
 
@@ -21,7 +22,7 @@ export interface Migration {
   down?: string | ((db: Db) => void);
 }
 
-export const MIGRATIONS: Migration[] = [m001 as Migration, m002 as Migration];
+export const MIGRATIONS: Migration[] = [m001 as Migration, m002 as Migration, m003 as Migration];
 
 function ensureMetaTable(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
