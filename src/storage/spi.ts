@@ -6,6 +6,7 @@
  *  4. Writer 队列单写者；多进程一致性由 SQLite WAL + busy_timeout + 条件写承载
  */
 import type { MemoryNode, Edge, OutboxEntry, NodeId, RevisionId, ContentHash, TxResult } from './types.ts';
+import type { AuthContext } from '../auth/context.ts';
 
 export interface Cas {
   expectedRevision: RevisionId;
@@ -36,11 +37,19 @@ export interface BlobHandle {
   inArchive: boolean;
 }
 
+/** 查询标识：按逻辑记忆取 CURRENT，或按具体版本精确取（P1-D 语义分离） */
+export type NodeRef =
+  | { kind: 'node'; nodeId: NodeId }
+  | { kind: 'revision'; revisionId: RevisionId };
+
 /** 六原语（v1.4 §1） */
 export interface StorageProvider {
-  get(id: NodeId, opts?: { includeArchived?: boolean }): Promise<MemoryNode | null>;
+  get(
+    ref: NodeRef,
+    opts?: { includeArchived?: boolean; auth?: AuthContext }
+  ): Promise<MemoryNode | null>;
   put(node: MemoryNode, edges: Edge[], outbox: OutboxEntry[], cas?: Cas): Promise<TxResult>;
-  query(q: { text?: string; scope: Partial<MemoryNode['scope']> }): Promise<Hit[]>;
+  query(q: { text?: string; scope?: Partial<MemoryNode['scope']> }, auth: AuthContext): Promise<Hit[]>;
   graphTraverse(from: NodeId, budget: TraverseBudget): Promise<Subgraph>; // MVP 阶段一: throw UNIMPLEMENTED
   vectorSearch(v: Float32Array, budget: number): Promise<Hit[]>;          // MVP 阶段一: throw UNIMPLEMENTED
   blobRef(hash: ContentHash): Promise<BlobHandle>;
@@ -60,9 +69,9 @@ export interface StorageTx extends StorageProvider {
     outbox: OutboxEntry[],
     cas?: Cas
   ): Promise<TxResult>;
-  minimize(id: NodeId, archive: BlobHandle, cas: Cas): Promise<TxResult>;
-  purge(id: NodeId, reasonCategory: string, cas: Cas): Promise<TxResult>;
-  revive(id: NodeId, cas: Cas): Promise<TxResult>;
+  minimize(revisionId: RevisionId, archive: BlobHandle, cas: Cas): Promise<TxResult>;
+  purge(nodeId: NodeId, reasonCategory: string, cas: Cas): Promise<TxResult>;
+  revive(revisionId: RevisionId, cas: Cas): Promise<TxResult>;
   /** 启动对账：Ledger 有而节点表有 → 补删；归档存在但状态非 MINIMIZED → 补完成。幂等。 */
   reconcile(): Promise<{ fixed: number }>;
 }
