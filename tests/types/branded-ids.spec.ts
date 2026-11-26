@@ -53,9 +53,9 @@ describe('Branded ID — 编译期区分', () => {
   });
 
   it('supersedes 边不接受 NodeId（@ts-expect-error 在编译期生效）', () => {
+    // @ts-expect-error supersedes 边的 from 必须是 RevisionId，传 NodeId 编译期即失败
     const bad: Edge = {
       type: 'supersedes',
-      // @ts-expect-error supersedes 边必须使用 RevisionId
       from: asNodeId('mem-A'),
       to: asRevisionId('rev-B'),
       weight: 1,
