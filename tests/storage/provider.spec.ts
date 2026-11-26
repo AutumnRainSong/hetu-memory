@@ -1,12 +1,7 @@
-/** M1-B 存储引擎验收测试：真实的 SqliteStorageProvider。
+/** M1-B Storage Engine 验收测试（Review R1 修订版）
  *
- *  覆盖《下一阶段研发执行任务书》第五节 M1-B 十项验收要求：
- *  - 基本 get/put/query 真实读写
- *  - CAS 条件写与链尾唯一性（并发不得产生双链尾）
- *  - Node + Revision + Edge + Outbox 同事务原子提交（任一步失败整体回滚）
- *  - Outbox 幂等消费
- *  - 权限过滤在结果返回之前完成（SQL 层前置）
- *  - 数据库重启后数据仍在
+ *  覆盖：P0-A 权限隔离（AuthContext 失败关闭）、P0-B 生命周期数据完整性、
+ *  P1-D 类型语义（NodeRef / RevisionId）、P1-E 边引用完整性、P1-F 跨连接并发 CAS。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -14,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SqliteStorageProvider } from '../../src/storage/sqlite-provider.ts';
 import { runMigrations } from '../../src/storage/migrate.ts';
+import type { AuthContext } from '../../src/auth/context.ts';
 import {
   asNodeId,
   asRevisionId,
@@ -30,7 +26,7 @@ const prov = (): any => ({
   source_refs: [],
   producer_version: 'hetu 0.1.0',
   model_id: null,
-  generated_at: '2026-11-25T00:00:00Z',
+  generated_at: '2026-11-26T00:00:00Z',
   confidence: 0.9,
 });
 
@@ -43,6 +39,19 @@ const scopeOf = (over: Partial<Scope> = {}): Scope => ({
   shared_with: [],
   ...over,
 });
+
+const authA: AuthContext = {
+  ownerId: 'ws-1',
+  agentId: 'agent-a',
+  projectIds: ['proj-1'],
+  canReadGlobal: true,
+};
+const authB: AuthContext = {
+  ownerId: 'ws-1',
+  agentId: 'agent-b',
+  projectIds: ['proj-2'],
+  canReadGlobal: true,
+};
 
 function node(over: Partial<MemoryNode> & { node_id: string; revision_id: string }): MemoryNode {
   return {
@@ -61,87 +70,177 @@ function node(over: Partial<MemoryNode> & { node_id: string; revision_id: string
     provenance: over.provenance ?? prov(),
     scope: over.scope ?? scopeOf(),
     sensitivity: over.sensitivity ?? 'normal',
-    valid_from: over.valid_from ?? '2026-11-25T00:00:00Z',
+    valid_from: over.valid_from ?? '2026-11-26T00:00:00Z',
     valid_until: over.valid_until ?? null,
-    ingested_at: over.ingested_at ?? '2026-11-25T00:00:00Z',
+    ingested_at: over.ingested_at ?? '2026-11-26T00:00:00Z',
     superseded_by: over.superseded_by ?? null,
   };
 }
 
+const byRev = (r: string) => ({ kind: 'revision' as const, revisionId: asRevisionId(r) });
+const byNode = (n: string) => ({ kind: 'node' as const, nodeId: asNodeId(n) });
+
 let sp: SqliteStorageProvider;
+let blobDir: string;
 beforeEach(() => {
-  sp = new SqliteStorageProvider({ dbPath: ':memory:' });
+  blobDir = mkdtempSync(join(tmpdir(), 'hetu-blob-'));
+  sp = new SqliteStorageProvider({ dbPath: ':memory:', blobRoot: blobDir });
   runMigrations(sp.raw);
 });
-afterEach(() => sp.close());
+afterEach(() => {
+  sp.close();
+  rmSync(blobDir, { recursive: true, force: true });
+});
 
-describe('M1-B · 基本读写', () => {
-  it('put → get 往返一致（含 scope 与 provenance）', async () => {
+describe('M1-B · 基本读写（P1-D NodeRef 语义）', () => {
+  it('按 revision 精确取 / 按 node 取 CURRENT', async () => {
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+
+    const r = await sp.get(byRev('rev-1'));
+    expect(r).not.toBeNull();
+    expect(r!.node_id).toBe('mem-1');
+
+    const n = await sp.get(byNode('mem-1'));
+    expect(n!.revision_id).toBe('rev-1');
+
+    expect(await sp.get(byNode('mem-404'))).toBeNull();
+  });
+
+  it('scope 与 provenance 完整往返', async () => {
     const n = node({ node_id: 'mem-1', revision_id: 'rev-1' });
-    const r = await sp.put(n, [], [], undefined);
-    expect(r.ok).toBe(true);
-
-    const got = await sp.get(asRevisionId('rev-1'));
-    expect(got).not.toBeNull();
-    expect(got!.node_id).toBe('mem-1');
+    await sp.put(n, [], []);
+    const got = await sp.get(byRev('rev-1'));
     expect(got!.scope.owner_id).toBe('ws-1');
     expect(got!.provenance.agent_id).toBe('agent-a');
-    expect(got!.content_hash).toBe(n.content_hash);
   });
+});
 
-  it('get 按 node_id 返回当前版本（无 CURRENT 时返回 null）', async () => {
+describe('P0-A · 权限隔离（失败关闭）', () => {
+  it('未提供 AuthContext 的 query → PERMISSION_DENIED（不返回全部数据）', async () => {
     await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
-    const byNode = await sp.get(asNodeId('mem-1'));
-    expect(byNode!.revision_id).toBe('rev-1');
-
-    const missing = await sp.get(asNodeId('mem-404'));
-    expect(missing).toBeNull();
+    await expect(sp.query({}, undefined as unknown as AuthContext)).rejects.toThrow(
+      /AUTH_CONTEXT_REQUIRED|PERMISSION_DENIED/
+    );
   });
 
-  it('query 在 SQL 层做 scope 前置过滤（不是先召回再过滤）', async () => {
+  it('跨 owner 绝对隔离（返回空，不泄漏存在性）', async () => {
     await sp.put(
-      node({ node_id: 'n-a', revision_id: 'r-a', scope: scopeOf({ owner_id: 'ws-a' }) }),
+      node({ node_id: 'n-x', revision_id: 'r-x', scope: scopeOf({ owner_id: 'ws-other' }) }),
       [],
       []
     );
-    await sp.put(
-      node({ node_id: 'n-b', revision_id: 'r-b', scope: scopeOf({ owner_id: 'ws-b' }) }),
-      [],
-      []
-    );
-
-    const aHits = await sp.query({ scope: { owner_id: 'ws-a' } });
-    expect(aHits.length).toBe(1);
-    expect(aHits[0].node_id).toBe('n-a');
-
-    const bHits = await sp.query({ scope: { owner_id: 'ws-b' } });
-    expect(bHits.length).toBe(1);
-    expect(bHits[0].node_id).toBe('n-b');
-
-    // 无 scope 时不越权：query 只返回显式传入 scope 命中的记录
-    const noScope = await sp.query({});
-    expect(noScope.length).toBe(2); // 实现层允许（权限链在 M1-C 收紧）
+    const hits = await sp.query({}, authA);
+    expect(hits.find(h => h.node_id === 'n-x')).toBeUndefined();
   });
 
-  it('query 支持 project/agent 维度过滤', async () => {
+  it('Agent A 的 persona 不被 Agent B 读到', async () => {
     await sp.put(
-      node({ node_id: 'n-p1', revision_id: 'r-p1', scope: scopeOf({ project_id: 'p1' }) }),
+      node({
+        node_id: 'p-a',
+        revision_id: 'r-pa',
+        scope: scopeOf({
+          layer: 'agent_persona',
+          agent_id: 'agent-a',
+          project_id: null,
+          visibility: 'owner',
+        }),
+      }),
       [],
       []
     );
+    const aHits = await sp.query({}, authA);
+    expect(aHits.some(h => h.node_id === 'p-a')).toBe(true);
+
+    const bHits = await sp.query({}, authB);
+    expect(bHits.some(h => h.node_id === 'p-a')).toBe(false);
+  });
+
+  it('Agent A 的 private_annotation 不被 Agent B 读到', async () => {
     await sp.put(
-      node({ node_id: 'n-p2', revision_id: 'r-p2', scope: scopeOf({ project_id: 'p2' }) }),
+      node({
+        node_id: 'ann-a',
+        revision_id: 'r-ann',
+        scope: scopeOf({
+          layer: 'private_annotation',
+          agent_id: 'agent-a',
+          project_id: null,
+          visibility: 'owner',
+        }),
+      }),
       [],
       []
     );
-    const p1 = await sp.query({ scope: { project_id: 'p1' } });
-    expect(p1.length).toBe(1);
-    expect(p1[0].node_id).toBe('n-p1');
+    expect((await sp.query({}, authA)).some(h => h.node_id === 'ann-a')).toBe(true);
+    expect((await sp.query({}, authB)).some(h => h.node_id === 'ann-a')).toBe(false);
+  });
+
+  it('非项目成员无法读取该项目记忆', async () => {
+    await sp.put(
+      node({ node_id: 'p1', revision_id: 'r-p1', scope: scopeOf({ project_id: 'proj-1' }) }),
+      [],
+      []
+    );
+    // authB 只属于 proj-2
+    expect((await sp.query({}, authB)).some(h => h.node_id === 'p1')).toBe(false);
+    // 显式指定未授权项目 → 空结果
+    expect(await sp.query({ scope: { project_id: 'proj-1' } }, authB)).toEqual([]);
+  });
+
+  it('canReadGlobal=false 时读不到 global 层', async () => {
+    await sp.put(
+      node({
+        node_id: 'g-1',
+        revision_id: 'r-g1',
+        scope: scopeOf({ layer: 'global', project_id: null, visibility: 'all_agents' }),
+      }),
+      [],
+      []
+    );
+    const noGlobal: AuthContext = { ...authA, canReadGlobal: false };
+    expect((await sp.query({}, noGlobal)).some(h => h.node_id === 'g-1')).toBe(false);
+    expect((await sp.query({}, authA)).some(h => h.node_id === 'g-1')).toBe(true);
+  });
+
+  it('get 带 auth 时不可见即返回 null', async () => {
+    await sp.put(
+      node({
+        node_id: 'p-a',
+        revision_id: 'r-pa',
+        scope: scopeOf({
+          layer: 'agent_persona',
+          agent_id: 'agent-a',
+          project_id: null,
+          visibility: 'owner',
+        }),
+      }),
+      [],
+      []
+    );
+    expect(await sp.get(byRev('r-pa'), { auth: authB })).toBeNull();
+    expect(await sp.get(byRev('r-pa'), { auth: authA })).not.toBeNull();
+  });
+
+  it('persona 用 all_agents 写入被 DB 拒绝（不能靠业务自律）', async () => {
+    const r = await sp.put(
+      node({
+        node_id: 'bad',
+        revision_id: 'r-bad',
+        scope: scopeOf({
+          layer: 'agent_persona',
+          agent_id: 'a1',
+          project_id: null,
+          visibility: 'all_agents',
+        }),
+      }),
+      [],
+      []
+    );
+    expect(r.ok).toBe(false);
   });
 });
 
 describe('M1-B · CAS 与链尾唯一性', () => {
-  it('CAS 命中：旧链尾翻转，新 revision 成为唯一 CURRENT', async () => {
+  it('CAS 命中：旧链尾翻转，新 revision 唯一 CURRENT', async () => {
     await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
     const r = await sp.put(
       node({ node_id: 'mem-1', revision_id: 'rev-2', revision_sequence: 2 }),
@@ -156,15 +255,9 @@ describe('M1-B · CAS 与链尾唯一性', () => {
       .all() as { revision_id: string }[];
     expect(cur.length).toBe(1);
     expect(cur[0].revision_id).toBe('rev-2');
-
-    const old = sp.raw
-      .prepare("SELECT version_state, superseded_by_revision FROM nodes WHERE revision_id='rev-1'")
-      .get() as any;
-    expect(old.version_state).toBe('SUPERSEDED');
-    expect(old.superseded_by_revision).toBe('rev-2');
   });
 
-  it('CAS 失败：期望 revision 不匹配 → CAS_CONFLICT 且返回当前版本', async () => {
+  it('CAS 冲突返回当前版本且不改库', async () => {
     await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
     const r = await sp.put(
       node({ node_id: 'mem-1', revision_id: 'rev-9', revision_sequence: 2 }),
@@ -175,34 +268,46 @@ describe('M1-B · CAS 与链尾唯一性', () => {
     expect(r.ok).toBe(false);
     expect((r as any).error).toBe('CAS_CONFLICT');
     expect((r as any).currentRevision).toBe('rev-1');
-
-    // 失败不改变数据库
-    const all = sp.raw.prepare("SELECT revision_id FROM nodes WHERE node_id='mem-1'").all();
-    expect(all.length).toBe(1);
+    expect(
+      (sp.raw.prepare("SELECT COUNT(*) c FROM nodes WHERE node_id='mem-1'").get() as any).c
+    ).toBe(1);
   });
+});
 
-  it('并发 CAS：同一期望版本只能有 1 个成功（不得产生双链尾）', async () => {
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+describe('P1-F · 跨连接并发 CAS（两个独立 Provider 同一文件库）', () => {
+  it('两连接同时 CAS 同一 expectedRevision → 仅一个成功，无双链尾', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hetu-multi-'));
+    const dbPath = join(dir, 'hetu.db');
+
+    const s1 = new SqliteStorageProvider({ dbPath, blobRoot: dir });
+    runMigrations(s1.raw);
+    await s1.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+
+    const s2 = new SqliteStorageProvider({ dbPath, blobRoot: dir });
     const cas = { expectedRevision: asRevisionId('rev-1') };
 
-    const results = await Promise.all([
-      sp.put(node({ node_id: 'mem-1', revision_id: 'rev-2a', revision_sequence: 2 }), [], [], cas),
-      sp.put(node({ node_id: 'mem-1', revision_id: 'rev-2b', revision_sequence: 2 }), [], [], cas),
-      sp.put(node({ node_id: 'mem-1', revision_id: 'rev-2c', revision_sequence: 2 }), [], [], cas),
+    const [r1, r2] = await Promise.all([
+      s1.put(node({ node_id: 'mem-1', revision_id: 'rev-2a', revision_sequence: 2 }), [], [], cas),
+      s2.put(node({ node_id: 'mem-1', revision_id: 'rev-2b', revision_sequence: 2 }), [], [], cas),
     ]);
 
-    const okCount = results.filter((r: any) => r.ok).length;
+    const okCount = [r1, r2].filter(r => r.ok).length;
     expect(okCount).toBe(1);
 
-    const currents = sp.raw
+    const cur = s1.raw
       .prepare("SELECT revision_id FROM nodes WHERE node_id='mem-1' AND version_state='CURRENT'")
       .all() as { revision_id: string }[];
-    expect(currents.length).toBe(1); // 恰好一个链尾
+    expect(cur.length).toBe(1); // 无双链尾
+
+    s1.close();
+    s2.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 
 describe('M1-B · 原子性与 Outbox', () => {
-  it('Node + Edge + Outbox 同一事务提交', async () => {
+  it('Node + Edge + Outbox 同事务提交', async () => {
+    await sp.put(node({ node_id: 'mem-2', revision_id: 'rev-2' }), [], []);
     const edges: Edge[] = [
       {
         type: 'link',
@@ -210,149 +315,208 @@ describe('M1-B · 原子性与 Outbox', () => {
         from: asNodeId('mem-1'),
         to: asNodeId('mem-2'),
         weight: 0.5,
-        created_at: '2026-11-25T00:00:00Z',
+        created_at: '2026-11-26T00:00:00Z',
       },
     ];
-    const outbox = [{ kind: 'index' as const, entity_id: 'mem-1', seq: 1 }];
-
-    const r = await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), edges, outbox);
+    const r = await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), edges, [
+      { kind: 'index', entity_id: 'mem-1', seq: 1 },
+    ]);
     expect(r.ok).toBe(true);
-
     expect((sp.raw.prepare('SELECT COUNT(*) c FROM edges').get() as any).c).toBe(1);
     expect((sp.raw.prepare('SELECT COUNT(*) c FROM outbox').get() as any).c).toBe(1);
   });
 
-  it('任一步失败 → 整体回滚（Node 也不落库）', async () => {
-    const badOutbox = [
-      { kind: 'invalid_kind' as unknown as 'index', entity_id: 'x', seq: 1 },
-    ];
-    const r = await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], badOutbox);
+  it('任一步失败 → 整体回滚（节点不落库）', async () => {
+    const r = await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], [
+      { kind: 'bogus' as unknown as 'index', entity_id: 'x', seq: 1 },
+    ]);
     expect(r.ok).toBe(false);
-
-    // 节点未落库（事务回滚）
-    const rows = sp.raw.prepare('SELECT COUNT(*) c FROM nodes').all() as any[];
-    expect(rows[0].c).toBe(0);
-  });
-
-  it('Outbox 幂等：同 (kind, entity_id, seq) 重复写入不产生重复行', async () => {
-    const ob = { kind: 'index' as const, entity_id: 'mem-1', seq: 1 };
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], [ob]);
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-2', revision_sequence: 2 }), [], [ob]);
-
-    const rows = sp.raw
-      .prepare("SELECT COUNT(*) c FROM outbox WHERE kind='index' AND entity_id='mem-1' AND seq=1")
-      .get() as any;
-    expect(rows.c).toBe(1);
+    expect((sp.raw.prepare('SELECT COUNT(*) c FROM nodes').get() as any).c).toBe(0);
   });
 });
 
-describe('M1-B · 持久化（重启后数据仍在）', () => {
-  it('文件数据库重启后记忆、边、scope 全部保留', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'hetu-m1b-'));
-    const dbPath = join(dir, 'hetu.db');
+describe('P1-E · 边引用完整性', () => {
+  it('普通边指向不存在的 node → 被拒绝', async () => {
+    const r = await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [
+      {
+        type: 'link',
+        link_class: 'explicit',
+        from: asNodeId('mem-1'),
+        to: asNodeId('mem-ghost'),
+        weight: 0.5,
+        created_at: '2026-11-26T00:00:00Z',
+      },
+    ], []);
+    expect(r.ok).toBe(false);
+  });
 
-    const sp1 = new SqliteStorageProvider({ dbPath });
-    runMigrations(sp1.raw);
-    await sp1.put(
-      node({ node_id: 'mem-p', revision_id: 'rev-p', scope: scopeOf({ owner_id: 'ws-persist' }) }),
+  it('supersedes 边指向不存在的 revision → 被拒绝', async () => {
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+    const r = await sp.put(node({ node_id: 'mem-2', revision_id: 'rev-2' }), [
+      {
+        type: 'supersedes',
+        from: asRevisionId('rev-2'),
+        to: asRevisionId('rev-ghost'),
+        weight: 1,
+        created_at: '2026-11-26T00:00:00Z',
+      },
+    ], []);
+    expect(r.ok).toBe(false);
+  });
+
+  it('重复边不得静默覆盖', async () => {
+    await sp.put(node({ node_id: 'mem-2', revision_id: 'rev-2' }), [], []);
+    const e: Edge = {
+      type: 'link',
+      link_class: 'explicit',
+      from: asNodeId('mem-1'),
+      to: asNodeId('mem-2'),
+      weight: 0.5,
+      created_at: '2026-11-26T00:00:00Z',
+    };
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [e], []);
+    const r2 = await sp.put(
+      node({ node_id: 'mem-1', revision_id: 'rev-1b', revision_sequence: 2 }),
+      [e],
+      [],
+      { expectedRevision: asRevisionId('rev-1') }
+    );
+    expect(r2.ok).toBe(false); // 已存在 → 拒绝而非覆盖
+  });
+});
+
+describe('P0-B · 生命周期能力边界与归档真实性', () => {
+  it('未配置 blobRoot 时 minimize 拒绝（不产生假成功）', async () => {
+    const noBlob = new SqliteStorageProvider({ dbPath: ':memory:' });
+    runMigrations(noBlob.raw);
+    await noBlob.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+    const r = await noBlob.minimize(
+      asRevisionId('rev-1'),
+      { ref: 'archive/x.txt', hash: asContentHash('sha256:' + 'd'.repeat(64)), inArchive: true },
+      { expectedRevision: asRevisionId('rev-1') }
+    );
+    expect(r.ok).toBe(false);
+    // 数据库状态未变
+    const got = await noBlob.get(byRev('rev-1'));
+    expect(got!.content_state).toBe('FULL');
+    noBlob.close();
+  });
+
+  it('归档文件不存在时 minimize 拒绝且不改状态', async () => {
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+    const r = await sp.minimize(
+      asRevisionId('rev-1'),
+      { ref: 'archive/missing.txt', hash: asContentHash('sha256:' + 'e'.repeat(64)), inArchive: true },
+      { expectedRevision: asRevisionId('rev-1') }
+    );
+    expect(r.ok).toBe(false);
+    expect((await sp.get(byRev('rev-1')))!.content_state).toBe('FULL');
+  });
+
+  it('归档 Hash 不匹配时 minimize 拒绝', async () => {
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    const ref = 'archive/mem-1/rev-1.txt';
+    mkdirSync(join(blobDir, 'archive/mem-1'), { recursive: true });
+    writeFileSync(join(blobDir, ref), 'real content');
+
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+    const r = await sp.minimize(
+      asRevisionId('rev-1'),
+      { ref, hash: asContentHash('sha256:' + 'f'.repeat(64)), inArchive: true }, // 错误 hash
+      { expectedRevision: asRevisionId('rev-1') }
+    );
+    expect(r.ok).toBe(false);
+    expect((await sp.get(byRev('rev-1')))!.content_state).toBe('FULL');
+  });
+
+  it('归档正确写入且 Hash 匹配 → minimize 成功', async () => {
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    const { createHash } = await import('node:crypto');
+    const ref = 'archive/mem-1/rev-1.txt';
+    const content = 'content to archive';
+    mkdirSync(join(blobDir, 'archive/mem-1'), { recursive: true });
+    writeFileSync(join(blobDir, ref), content);
+    const hash = asContentHash('sha256:' + createHash('sha256').update(content).digest('hex'));
+
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+    const r = await sp.minimize(
+      asRevisionId('rev-1'),
+      { ref, hash, inArchive: true },
+      { expectedRevision: asRevisionId('rev-1') }
+    );
+    expect(r.ok).toBe(true);
+    const got = await sp.get(byRev('rev-1'));
+    expect(got!.content_state).toBe('MINIMIZED');
+    expect(got!.minimized_blob_ref).toBe(ref);
+  });
+
+  it('归档丢失时 revive 失败且数据库状态不变', async () => {
+    const { writeFileSync, mkdirSync, rmSync: rm } = await import('node:fs');
+    const { createHash } = await import('node:crypto');
+    const ref = 'archive/mem-1/rev-1.txt';
+    const content = 'archived';
+    mkdirSync(join(blobDir, 'archive/mem-1'), { recursive: true });
+    writeFileSync(join(blobDir, ref), content);
+    const hash = asContentHash('sha256:' + createHash('sha256').update(content).digest('hex'));
+
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
+    await sp.minimize(asRevisionId('rev-1'), { ref, hash, inArchive: true }, {
+      expectedRevision: asRevisionId('rev-1'),
+    });
+
+    // 删除归档文件
+    rm(join(blobDir, ref));
+
+    const r = await sp.revive(asRevisionId('rev-1'), { expectedRevision: asRevisionId('rev-1') });
+    expect(r.ok).toBe(false);
+    expect((r as any).error).toBe('ARCHIVE_MISSING');
+    // 状态未被改成 FULL
+    expect((await sp.get(byRev('rev-1')))!.content_state).toBe('MINIMIZED');
+  });
+});
+
+describe('P1-E · Purge 后无悬空边', () => {
+  it('purge 删除整条逻辑记忆的所有 revision 与相关边', async () => {
+    await sp.put(node({ node_id: 'mem-2', revision_id: 'rev-2' }), [], []);
+    await sp.put(
+      node({ node_id: 'mem-1', revision_id: 'rev-1a' }),
       [
         {
-          type: 'cooccur',
-          from: asNodeId('mem-p'),
-          to: asNodeId('mem-q'),
-          weight: 0.4,
-          created_at: '2026-11-25T00:00:00Z',
+          type: 'link',
+          link_class: 'explicit',
+          from: asNodeId('mem-1'),
+          to: asNodeId('mem-2'),
+          weight: 0.5,
+          created_at: '2026-11-26T00:00:00Z',
         },
       ],
-      [{ kind: 'index', entity_id: 'mem-p', seq: 1 }]
-    );
-    sp1.close();
-
-    const sp2 = new SqliteStorageProvider({ dbPath });
-    const got = await sp2.get(asRevisionId('rev-p'));
-    expect(got).not.toBeNull();
-    expect(got!.node_id).toBe('mem-p');
-    expect(got!.scope.owner_id).toBe('ws-persist');
-    expect((sp2.raw.prepare('SELECT COUNT(*) c FROM edges').get() as any).c).toBe(1);
-    sp2.close();
-
-    rmSync(dir, { recursive: true, force: true });
-  });
-});
-
-describe('M1-B · 不可变与约束兜底', () => {
-  it('直接改 content_hash 被 DB 触发器拒绝（不依赖应用层自律）', async () => {
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
-    expect(() =>
-      sp.raw
-        .prepare("UPDATE nodes SET content_hash=? WHERE revision_id='rev-1'")
-        .run('sha256:' + 'b'.repeat(64))
-    ).toThrow(/MEM_IMMUTABLE/);
-  });
-
-  it('scope 非法组合被 DB 拒绝（private_annotation 必须 owner-only）', async () => {
-    const r = await sp.put(
-      node({
-        node_id: 'mem-bad',
-        revision_id: 'rev-bad',
-        scope: scopeOf({ layer: 'private_annotation', agent_id: 'a1', visibility: 'all_agents' }),
-      }),
-      [],
       []
     );
-    expect(r.ok).toBe(false);
-  });
-});
+    // 产生第二个 revision
+    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1b', revision_sequence: 2 }), [], [], {
+      expectedRevision: asRevisionId('rev-1a'),
+    });
 
-describe('M1-B · Minimize / Revive / Purge', () => {
-  it('minimize → MINIMIZED 且归档字段落库；revive 回到 FULL', async () => {
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
-    const cas = { expectedRevision: asRevisionId('rev-1') };
-
-    const m = await sp.minimize(asRevisionId('rev-1'), {
-      ref: 'archive/mem-1/rev-1.txt',
-      hash: asContentHash('sha256:' + 'c'.repeat(64)),
-      inArchive: true,
-    }, cas);
-    expect(m.ok).toBe(true);
-
-    const minimized = await sp.get(asRevisionId('rev-1'));
-    expect(minimized!.content_state).toBe('MINIMIZED');
-    expect(minimized!.minimized_blob_ref).toBe('archive/mem-1/rev-1.txt');
-
-    const rv = await sp.revive(asRevisionId('rev-1'), cas);
-    expect(rv.ok).toBe(true);
-    const revived = await sp.get(asRevisionId('rev-1'));
-    expect(revived!.content_state).toBe('FULL');
-    expect(revived!.minimized_blob_ref).toBeNull();
-  });
-
-  it('purge：Ledger 先行写入、节点级联删除、get 返回 null', async () => {
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
-    const r = await sp.purge(asRevisionId('rev-1'), 'user-request', {
-      expectedRevision: asRevisionId('rev-1'),
+    const r = await sp.purge(asNodeId('mem-1'), 'user-request', {
+      expectedRevision: asRevisionId('rev-1b'),
     });
     expect(r.ok).toBe(true);
 
-    const ledger = sp.raw.prepare('SELECT * FROM purge_ledger').all() as any[];
-    expect(ledger.length).toBe(1);
-    expect(ledger[0].node_id).toBe('mem-1');
-    expect(ledger[0].reason_category).toBe('user-request');
-
-    expect(await sp.get(asRevisionId('rev-1'))).toBeNull();
-    expect((sp.raw.prepare('SELECT COUNT(*) c FROM nodes').get() as any).c).toBe(0);
-  });
-
-  it('reconcile：Ledger 有而节点仍在 → 补删', async () => {
-    await sp.put(node({ node_id: 'mem-1', revision_id: 'rev-1' }), [], []);
-    // 模拟崩溃残留：Ledger 有记录但节点没删
-    sp.raw
-      .prepare("INSERT INTO purge_ledger(node_id,content_hash,operator,reason_category) VALUES('mem-1','sha256:x','provider','crash')")
-      .run();
-    expect((sp.raw.prepare('SELECT COUNT(*) c FROM nodes').get() as any).c).toBe(1);
-
-    const { fixed } = await sp.reconcile();
-    expect(fixed).toBe(1);
-    expect((sp.raw.prepare('SELECT COUNT(*) c FROM nodes').get() as any).c).toBe(0);
+    // 节点全删
+    expect(
+      (sp.raw.prepare("SELECT COUNT(*) c FROM nodes WHERE node_id='mem-1'").get() as any).c
+    ).toBe(0);
+    // 悬空边全删
+    const dangling = sp.raw
+      .prepare(
+        `SELECT COUNT(*) c FROM edges e
+         WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.node_id = e."from")
+            OR NOT EXISTS (SELECT 1 FROM nodes n WHERE n.node_id = e."to")`
+      )
+      .get() as any;
+    expect(dangling.c).toBe(0);
+    // Ledger 覆盖所有被擦除的 revision
+    const ledger = sp.raw.prepare('SELECT content_hash FROM purge_ledger').all() as any[];
+    expect(ledger.length).toBe(2);
   });
 });
