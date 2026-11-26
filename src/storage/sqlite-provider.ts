@@ -14,6 +14,7 @@ import {
   type Edge,
   type OutboxEntry,
   type NodeId,
+  type RevisionId,
   type ContentHash,
   type TxResult,
   type Scope,
@@ -24,8 +25,10 @@ import {
   nodeIdStr,
   revisionIdStr,
 } from './types.ts';
+import { type AuthContext, AuthRequiredError } from '../auth/context.ts';
 import type {
   StorageTx,
+  NodeRef,
   Cas,
   Hit,
   BlobHandle,
@@ -110,15 +113,34 @@ export class SqliteStorageProvider implements StorageTx {
 
   // ───────────────────────── 读 ─────────────────────────
 
-  async get(id: NodeId, opts: { includeArchived?: boolean } = {}): Promise<MemoryNode | null> {
-    // 优先按 revision_id 精确命中；否则按 node_id 取 CURRENT
-    let row = this.db.prepare('SELECT * FROM nodes WHERE revision_id=?').get(nodeIdStr(id)) as
-      | NodeRow
-      | undefined;
-    if (!row) {
+  async get(
+    ref: NodeRef,
+    opts: { includeArchived?: boolean; auth?: AuthContext } = {}
+  ): Promise<MemoryNode | null> {
+    let row: NodeRow | undefined;
+    if (ref.kind === 'revision') {
+      row = this.db
+        .prepare('SELECT * FROM nodes WHERE revision_id=?')
+        .get(revisionIdStr(ref.revisionId)) as NodeRow | undefined;
+    } else {
       row = this.db
         .prepare("SELECT * FROM nodes WHERE node_id=? AND version_state='CURRENT'")
-        .get(nodeIdStr(id)) as NodeRow | undefined;
+        .get(nodeIdStr(ref.nodeId)) as NodeRow | undefined;
+    }
+    // 授权（P0-A）：带 auth 时检查可见性；不带 auth 仅供存储层内部使用
+    if (row && opts.auth) {
+      const a = opts.auth;
+      const n = this.rowToNode(row);
+      const visible =
+        n.scope.owner_id === a.ownerId &&
+        (n.scope.layer === 'user_identity' ||
+          (n.scope.layer === 'project' &&
+            n.scope.project_id !== null &&
+            a.projectIds.includes(n.scope.project_id)) ||
+          (n.scope.layer === 'global' && a.canReadGlobal) ||
+          ((n.scope.layer === 'agent_persona' || n.scope.layer === 'private_annotation') &&
+            n.scope.agent_id === a.agentId));
+      if (!visible) return null; // 不可见 → 等同不存在（不泄漏存在性）
     }
     if (!row) return null;
     // PURGED 不落节点表（由 purge_ledger 承载）；此处只需处理业务可见性
@@ -126,25 +148,55 @@ export class SqliteStorageProvider implements StorageTx {
     return this.rowToNode(row);
   }
 
-  async query(q: { text?: string; scope?: Partial<Scope> }): Promise<Hit[]> {
-    // 权限前置：scope 条件进 SQL，不在内存里过滤
-    const where: string[] = ["n.version_state='CURRENT'", "n.content_state IN ('FULL','MINIMIZED','STUB')"];
-    const params: (string | number)[] = [];
+  /** 权限前置查询（P0-A）：必须携带可信 AuthContext，缺失即失败关闭。
+   *
+   *  授权推导规则（调用方不可绕过）：
+   *  - 强制 owner_id = auth.ownerId（工作空间绝对隔离）
+   *  - project 层：project_id 必须 ∈ auth.projectIds（可信成员关系，非客户端自述）
+   *  - global 层：需 auth.canReadGlobal
+   *  - agent_persona / private_annotation：仅 agent_id = auth.agentId 可见
+   *  - user_identity：仅 owner 本人可见
+   */
+  async query(
+    q: { text?: string; scope?: Partial<Scope> },
+    auth: AuthContext
+  ): Promise<Hit[]> {
+    if (!auth || !auth.ownerId || !auth.agentId) throw new AuthRequiredError();
 
+    const where: string[] = [
+      "n.version_state='CURRENT'",
+      "n.content_state IN ('FULL','MINIMIZED','STUB')",
+      'n.owner_id = ?',
+    ];
+    const params: (string | number)[] = [auth.ownerId];
+
+    // 层可见性由授权推导，不接受客户端传 layer
+    const visibleLayerExpr = [
+      `(n.layer = 'user_identity')`,
+      `(n.layer = 'project' AND n.project_id IN (${auth.projectIds.length ? auth.projectIds.map(() => '?').join(',') : "''"}))`,
+      `(n.layer = 'global' AND ${auth.canReadGlobal ? '1' : '0'} = 1)`,
+      `(n.layer IN ('agent_persona','private_annotation') AND n.agent_id = ?)`,
+    ].join(' OR ');
+    where.push(`(${visibleLayerExpr})`);
+    params.push(...auth.projectIds);
+    params.push(auth.agentId);
+
+    // 客户端可选的收窄条件（只能进一步缩小，不能扩大）
     const sc = q.scope ?? {};
-    if (sc.owner_id) {
-      where.push('n.owner_id = ?');
-      params.push(sc.owner_id);
-    }
     if (sc.layer) {
       where.push('n.layer = ?');
       params.push(sc.layer);
     }
     if (sc.project_id) {
+      if (!auth.projectIds.includes(sc.project_id)) {
+        return []; // 未授权项目 → 空结果（不泄漏存在性）
+      }
       where.push('n.project_id = ?');
       params.push(sc.project_id);
     }
     if (sc.agent_id) {
+      // 只能查自己
+      if (sc.agent_id !== auth.agentId) return [];
       where.push('n.agent_id = ?');
       params.push(sc.agent_id);
     }
@@ -252,12 +304,18 @@ export class SqliteStorageProvider implements StorageTx {
     }
   }
 
-  async minimize(id: NodeId, archive: BlobHandle, cas: Cas): Promise<TxResult> {
+  async minimize(revisionId: RevisionId, archive: BlobHandle, cas: Cas): Promise<TxResult> {
+    // 能力边界（P0-B）：未配置归档存储时不允许调用，防止"状态变了但归档没落"的假成功
+    if (!this.blobRoot) return { ok: false, error: 'ARCHIVE_MISSING' };
     try {
+      // 归档必须先真实落盘并校验 Hash（失败即不改库）
+      const archiveCheck = await this.writeArchive(archive);
+      if (!archiveCheck.ok) return { ok: false, error: 'ARCHIVE_MISSING' };
+
       return await this.withTx<TxResult>(() => {
         const row = this.db
           .prepare('SELECT * FROM nodes WHERE revision_id=?')
-          .get(nodeIdStr(id)) as NodeRow | undefined;
+          .get(revisionIdStr(revisionId)) as NodeRow | undefined;
         if (!row) return { ok: false, error: 'INVALID_STATE' };
         if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
           return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
@@ -276,25 +334,40 @@ export class SqliteStorageProvider implements StorageTx {
     }
   }
 
-  async purge(id: NodeId, reasonCategory: string, cas: Cas): Promise<TxResult> {
+  async purge(nodeId: NodeId, reasonCategory: string, cas: Cas): Promise<TxResult> {
     try {
       return await this.withTx<TxResult>(() => {
+        // Purge 作用于整个逻辑记忆：CAS 校验对象是当前链尾
         const row = this.db
-          .prepare('SELECT * FROM nodes WHERE revision_id=?')
-          .get(nodeIdStr(id)) as NodeRow | undefined;
+          .prepare("SELECT * FROM nodes WHERE node_id=? AND version_state='CURRENT'")
+          .get(nodeIdStr(nodeId)) as NodeRow | undefined;
         if (!row) return { ok: false, error: 'PURGED_FINAL' };
         if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
           return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
         }
-        // 两阶段：Ledger 先行（提交点）→ 级联删除
+        // Ledger 必须覆盖该逻辑记忆的**全部** revision（防旧版本经备份/导入复活）
+        const allRevisions = this.db
+          .prepare('SELECT revision_id, content_hash FROM nodes WHERE node_id=?')
+          .all(row.node_id) as { revision_id: string; content_hash: string }[];
+        const ledgerInsert = this.db.prepare(
+          `INSERT INTO purge_ledger(node_id, content_hash, operator, reason_category)
+           VALUES(?,?,?,?)`
+        );
+        for (const r of allRevisions) {
+          ledgerInsert.run(row.node_id, r.content_hash, 'provider', reasonCategory);
+        }
+
+        // 普通边端点用 node_id；supersedes 边端点用 revision_id
         this.db
           .prepare(
-            `INSERT INTO purge_ledger(node_id, content_hash, operator, reason_category)
-             VALUES(?,?,?,?)`
+            `DELETE FROM edges WHERE type <> 'supersedes' AND ("from"=? OR "to"=?)`
           )
-          .run(row.node_id, row.content_hash, 'provider', reasonCategory);
-
-        this.db.prepare('DELETE FROM edges WHERE "from"=? OR "to"=?').run(row.revision_id, row.revision_id);
+          .run(row.node_id, row.node_id);
+        for (const r of allRevisions) {
+          this.db
+            .prepare(`DELETE FROM edges WHERE type = 'supersedes' AND ("from"=? OR "to"=?)`)
+            .run(r.revision_id, r.revision_id);
+        }
         this.db.prepare('DELETE FROM nodes WHERE node_id=?').run(row.node_id);
         return { ok: true, revision_id: asRevisionId(row.revision_id) };
       });
@@ -303,12 +376,21 @@ export class SqliteStorageProvider implements StorageTx {
     }
   }
 
-  async revive(id: NodeId, cas: Cas): Promise<TxResult> {
+  async revive(revisionId: RevisionId, cas: Cas): Promise<TxResult> {
+    // 归档校验必须在任何写操作之前完成（失败即不改库）
+    const row0 = this.db
+      .prepare('SELECT * FROM nodes WHERE revision_id=?')
+      .get(revisionIdStr(revisionId)) as NodeRow | undefined;
+    if (!row0) return { ok: false, error: 'PURGED_FINAL' };
+    if (row0.content_state === 'MINIMIZED' || row0.content_state === 'TOMBSTONE') {
+      const verified = await this.verifyArchive(row0.minimized_blob_ref, row0.minimized_blob_hash);
+      if (!verified) return { ok: false, error: 'ARCHIVE_MISSING' };
+    }
     try {
       return await this.withTx<TxResult>(() => {
         const row = this.db
           .prepare('SELECT * FROM nodes WHERE revision_id=?')
-          .get(nodeIdStr(id)) as NodeRow | undefined;
+          .get(revisionIdStr(revisionId)) as NodeRow | undefined;
         if (!row) return { ok: false, error: 'PURGED_FINAL' };
         if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
           return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
@@ -379,6 +461,53 @@ export class SqliteStorageProvider implements StorageTx {
 
   // ───────────────────── 内部 helpers ─────────────────────
 
+  // ── P0-B：归档真实存储与校验 ──
+
+  /** 写入归档文件：真实落盘 + 存在性 + Hash 校验 */
+  private async writeArchive(archive: BlobHandle): Promise<{ ok: boolean }> {
+    if (!this.blobRoot) {
+      // 未配置 blobRoot 时不冒充已归档（否则 Minimize 不可信）
+      return { ok: false };
+    }
+    const { mkdir, writeFile, readFile } = await import('node:fs/promises');
+    const { createHash } = await import('node:crypto');
+    const { dirname, join } = await import('node:path');
+    const abs = join(this.blobRoot, archive.ref);
+    try {
+      await mkdir(dirname(abs), { recursive: true });
+      // 归档内容由调用方通过 blobRef 提供；此处校验"内容已存在"或写入占位
+      // 真实内容来源：content_ref 指向的主区 blob（由上层读取后传入）
+      // 为可验证性，这里要求归档文件必须已由调用方写入，否则拒绝
+      const buf = await readFile(abs);
+      const h = 'sha256:' + createHash('sha256').update(buf).digest('hex');
+      return { ok: h === String(archive.hash) };
+    } catch {
+      // 文件不存在 → 尝试创建空占位再校验（生产由上层写入真实内容）
+      try {
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, '');
+        return { ok: false };
+      } catch {
+        return { ok: false };
+      }
+    }
+  }
+
+  /** 校验归档文件存在且 Hash 匹配（Revive 前置条件） */
+  private async verifyArchive(ref: string | null, expectedHash: string | null): Promise<boolean> {
+    if (!ref || !this.blobRoot) return false;
+    const { readFile } = await import('node:fs/promises');
+    const { createHash } = await import('node:crypto');
+    const { join } = await import('node:path');
+    try {
+      const buf = await readFile(join(this.blobRoot, ref));
+      const h = 'sha256:' + createHash('sha256').update(buf).digest('hex');
+      return expectedHash ? h === expectedHash : true;
+    } catch {
+      return false;
+    }
+  }
+
   private insertNode(node: MemoryNode): void {
     const scope = node.scope;
     this.db
@@ -425,7 +554,7 @@ export class SqliteStorageProvider implements StorageTx {
     const isSupersedes = e.type === 'supersedes';
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO edges(type, link_class, "from", "to", weight, created_at)
+        `INSERT INTO edges(type, link_class, "from", "to", weight, created_at)
          VALUES(?,?,?,?,?,?)`
       )
       .run(
