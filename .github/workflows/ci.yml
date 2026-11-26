@@ -7,7 +7,7 @@ concurrency:
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**', 'feat/**']
   pull_request:
     branches: [main]
 jobs:
