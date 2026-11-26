@@ -33,14 +33,17 @@
 
 ## 当前真实状态（2026-11-25）
 
-- **当前 commit**：`29c4d2b` + Rev4 修订（待推送）
-- **测试**：11 文件 / **99 项全绿**；lint ✅ tsc ✅ 依赖审计 **0 漏洞**
+- **当前位置**：分支 `fix/review-r1`（Review R1 定点修订，尚未合并 main）
+- **main 基线**：`bd0842e1`
+- **测试**：12 文件 / **126 项全绿**；lint ✅ tsc ✅ 类型契约 ✅ 依赖审计 **0 漏洞**
 - **M1-A Rev4 已交付待独立复审**：
   - A1 MINIMIZED 归档字段保全 · A2 旧数据显式映射（manifest + dryRun）· A3 迁移前环检测
   - B1 Branded ID（NodeId/RevisionId/ContentHash）· B2 Edge 判别联合 · B3 Scope 五类契约 14 用例 · B4 洛书语义校验
   - 依赖治理：移除未使用的 zod，vitest 升 5.x → 0 漏洞；CI 增加审计门禁
-- **尚未实现**：StorageProvider 真实实现、CAS/事务/Outbox、Remember/Recall 业务链、权限执行链
-- **下一阶段启动条件**：M1-A Rev4 通过独立复审 → 进入 M1-B Storage Engine
+- **已实现（待 R1 验收）**：`SqliteStorageProvider`（CAS 三步链翻 / 事务原子性 / Outbox 幂等 / Scope 前置过滤 / 归档校验 / Purge 全链清理 / 启动对账）
+- **Review R1 修订内容**：P0-A 权限失败关闭（AuthContext）、P0-B 归档真实性校验、P1-C dryRun 硬拦截、P1-D NodeRef 与类型契约 CI、P1-E 边引用完整性、P1-F 跨连接并发 CAS
+- **尚未实现**：Remember/Recall 业务链与权限执行链（M1-C）、Proposal/讨论裁决（M4）
+- **下一阶段启动条件**：Review R1 通过 → 合并 main → M1-C
 
 ## 历史进度（M1-A Rev3）
 
