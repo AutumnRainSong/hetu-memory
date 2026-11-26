@@ -23,4 +23,6 @@ jobs:
         run: npm audit --audit-level=high --registry=https://registry.npmjs.org/
       - run: npm run lint
       - run: npm run build
+      - name: Type contract tests (branded ids)
+        run: npm run typecheck
       - run: npm test
