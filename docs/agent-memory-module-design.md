@@ -1,7 +1,17 @@
-# 河图 HeTu · 通用 Agent 记忆模块 —— 架构规格 v1.4（定稿）
+# 河图 HeTu · 通用 Agent 记忆模块 —— 架构规格 v1.5（定稿）
+## 变更记录（ADR）
+
+| 版本 | 日期 | 变更 | 影响范围 |
+|---|---|---|---|
+| **v1.5** | 2026-11-26 | **多 Agent 工作空间共享模型正式化**：① `owner_id` 正式定义为**工作空间边界**（一个用户/组织），不是 Agent ID；② 新增 `AuthContext`（ownerId / agentId / projectIds / canReadGlobal）作为查询的**强制授权上下文**，缺失即失败关闭（`PERMISSION_DENIED`）；③ `agent_persona` 与 `private_annotation` **强制 `visibility='owner'`**（DB CHECK + UPDATE 触发器双重保证，业务代码不可绕过）；④ 边引用完整性下沉 DB 触发器（普通边端点=node_id，supersedes 端点=revision_id，重复边拒绝覆盖） | 与 v1.4「多用户暂不实现、owner_id 仅预留」的表述不同。工作空间共享已进入实现基线。Proposal / Discussion / Decision 协作机制仍属 M4 |
+| v1.4 | 2026-11-23 | 收敛定稿（双维度状态机、删除三操作、Purge Ledger、权限前置硬过滤、五类归属、Embedding Worker、候选预算、性能标准） | — |
+
+> 设计修订遵循"不静默改变旧结论"：上表 v1.5 是对 v1.4 的**显式修订**，v1.4 原文保留可追溯。
+
+
 
 > **名实**：系统 **河图 HeTu**（"河出图"——龙马负出的那张最早的图，点即节点、位势即边）
-> **版本**：v1.4 收敛定稿（唯一工程基线；收敛报告产出已全部并入本文件，不再存在 v1.5）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
+> **版本**：v1.5（唯一工程基线；v1.5 相对 v1.4 的修订见上方 ADR）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
 > 收敛依据：docs/reviews/hetu-v1-convergence-analysis.md 与 docs/reviews/convergence-v15-report.md（五项专项：P0-1/P0-2/P0-3/P1-4/P1-5）
 > **状态**：设计冻结。本版本为团队实现的唯一依据；此后设计变更一律走"提案 → 用户/评审确认 → 文档先行 → 代码跟进"。
 > **配套**：洛书 Luoshu 交换格式（第 7 节）· continue_bro.md（AI 结对入职）· 执行者.md（团队画像）
