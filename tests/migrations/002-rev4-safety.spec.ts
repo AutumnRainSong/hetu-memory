@@ -239,3 +239,69 @@ describe('A3 — 历史 Revision 环检测（迁移前，非迁移后触发器�
     expect(getRevision(db, 'rev-1-1').superseded_by_revision).toBe('rev-1-2');
   });
 });
+
+describe('P1-C — dryRun 在任何条件下都不得写库', () => {
+  it('完整 manifest + dryRun → 仍只报告，数据库完全不变', () => {
+    insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1' });
+    const before = {
+      cols: (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name),
+      rows: (db.prepare('SELECT COUNT(*) c FROM nodes').get() as { c: number }).c,
+      migrations: (db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c,
+    };
+
+    let err: Error | null = null;
+    try {
+      runMigrations(db, {
+        legacyOwnerId: 'user-legacy',
+        dryRun: true,
+        legacyScopeManifest: {
+          'rev-1': { layer: 'project', project_id: 'p1', visibility: 'project_agents' },
+        },
+      });
+    } catch (e) {
+      err = e as Error;
+    }
+
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
+    expect(err!.message).toMatch(/未执行任何数据库写操作/);
+
+    const after = {
+      cols: (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name),
+      rows: (db.prepare('SELECT COUNT(*) c FROM nodes').get() as { c: number }).c,
+      migrations: (db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c,
+    };
+    expect(after).toEqual(before);
+  });
+
+  it('acceptDefaultScopeMapping + dryRun → 仍不写库', () => {
+    insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1' });
+    let err: Error | null = null;
+    try {
+      runMigrations(db, {
+        legacyOwnerId: 'user-legacy',
+        acceptDefaultScopeMapping: true,
+        dryRun: true,
+      });
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
+
+    const cols = (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name);
+    expect(cols).not.toContain('owner_id');
+  });
+
+  it('空库 + dryRun → 报告并在不写库的情况下返回', () => {
+    let err: Error | null = null;
+    try {
+      runMigrations(db, { dryRun: true });
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
+    expect((db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c).toBe(1);
+  });
+});
