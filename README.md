@@ -127,20 +127,22 @@ sequenceDiagram
 
 ## 当前真实进度
 
-> 最后更新：2026-11-25 · commit `29c4d2b`
+> 最后更新：2026-11-26 · 分支 `fix/review-r1`（Review R1 修订中）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 设计 | 主规格 v1.4 收敛定稿（11 轮审查协商） | ✅ 完成 |
 | **M0** | 工程骨架、CI、六项 P0 决策（DDR） | ✅ 完成 |
-| **M1-A** | 数据模型：Scope 持久化、RevisionId 分离、安全迁移 | 🔧 Rev3 已交付，**待 Rev4 收尾验收** |
-| **M1-B** | SQLite Storage Engine（CAS / 事务 / Outbox） | ⏳ 未开始（M1-A 验收后启动） |
-| **M1-C** | Remember → Persist → Recall 业务闭环 | ⏳ 未开始 |
+| **M1-A** | 数据模型：Scope 持久化、RevisionId 分离、安全迁移 | 🔧 Rev4 已交付，Review R1 修订中 |
+| **M1-B** | SQLite Storage Engine（CAS / 事务 / Outbox） | 🔧 已实现，**Review R1 定点修订中（未验收）** |
+| **M1-C** | Remember → Persist → Recall 业务闭环 + 权限执行链 | ⏳ Review R1 通过后启动 |
 | **M2** | 生命周期（Minimize / Forget / Purge） | ⏳ 未开始 |
 | **M3** | 后台可靠性（RAW / Digest / 背压） | ⏳ 未开始 |
 | **M4** | 洛书 / Proposal / 讨论裁决 / Embedding / 发布 | ⏳ 未开始 |
 
-**工程现状**：7 个测试文件、60 项测试通过；CI（lint + tsc + vitest）通过。存储引擎（StorageProvider 真实实现）尚未完成——当前只有接口定义、数据模型与迁移。
+**工程现状**：12 个测试文件、**126 项测试通过**；CI（lint + tsc + 类型契约 + vitest + 依赖审计）通过，`npm audit` 0 漏洞。
+存储引擎已实现（`SqliteStorageProvider`：CAS 三步链翻、事务原子性、Outbox 幂等、Scope 前置过滤、归档校验、Purge 全链清理），
+但**未经 Review R1 验收**，生命周期能力（Minimize/Revive/Purge）在真实归档验证完成前不得对外宣称可用。
 
 ## 研发路线
 
