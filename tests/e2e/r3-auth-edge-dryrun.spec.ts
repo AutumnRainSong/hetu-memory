@@ -10,7 +10,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from '../../src/storage/sqlite.ts';
 import { SqliteStorageProvider } from '../../src/storage/sqlite-provider.ts';
-import { BlobStore, sha256 } from '../../src/storage/blob-store.ts';
 import { runMigrations } from '../../src/storage/migrate.ts';
 import type { AuthContext } from '../../src/auth/context.ts';
 import {
