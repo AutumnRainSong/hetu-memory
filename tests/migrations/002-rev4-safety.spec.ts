@@ -171,23 +171,6 @@ describe('A2 — 旧数据归属必须显式映射（不得默认全部塞进 pr
     ).toThrow(/CHECK|constraint/);
   });
 
-  it('dryRun → 只报告不修改数据库', () => {
-    insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1-1' });
-
-    let err: Error | null = null;
-    try {
-      runMigrations(db, { legacyOwnerId: 'user-legacy', dryRun: true });
-    } catch (e) {
-      err = e as Error;
-    }
-    expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
-
-    // 数据库未被改动：仍是 001 结构
-    const cols = (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name);
-    expect(cols).not.toContain('owner_id');
-    expect((db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c).toBe(1);
-  });
 
   it('全部映射齐全时不需要 acceptDefaultScopeMapping', () => {
     insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1-1' });
@@ -240,68 +223,80 @@ describe('A3 — 历史 Revision 环检测（迁移前，非迁移后触发器�
   });
 });
 
-describe('P1-C — dryRun 在任何条件下都不得写库', () => {
-  it('完整 manifest + dryRun → 仍只报告，数据库完全不变', () => {
+describe('P1-D — dryRun 在任何条件下都不得写库（Runner 最外层拦截）', () => {
+  const snapshot = (db: InstanceType<typeof DatabaseSync>) => ({
+    cols: (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name),
+    rows: (db.prepare('SELECT COUNT(*) c FROM nodes').get() as { c: number }).c,
+    migrations: (db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c,
+  });
+
+  it('完整 manifest + dryRun → 返回报告，数据库完全不变', () => {
     insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1' });
-    const before = {
-      cols: (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name),
-      rows: (db.prepare('SELECT COUNT(*) c FROM nodes').get() as { c: number }).c,
-      migrations: (db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c,
-    };
+    const before = snapshot(db);
 
-    let err: Error | null = null;
-    try {
-      runMigrations(db, {
-        legacyOwnerId: 'user-legacy',
-        dryRun: true,
-        legacyScopeManifest: {
-          'rev-1': { layer: 'project', project_id: 'p1', visibility: 'project_agents' },
-        },
-      });
-    } catch (e) {
-      err = e as Error;
-    }
+    const report = runMigrations(db, {
+      legacyOwnerId: 'user-legacy',
+      dryRun: true,
+      legacyScopeManifest: {
+        'rev-1': { layer: 'project', project_id: 'p1', visibility: 'project_agents' },
+      },
+    }) as any;
 
-    expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
-    expect(err!.message).toMatch(/未执行任何数据库写操作/);
-
-    const after = {
-      cols: (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name),
-      rows: (db.prepare('SELECT COUNT(*) c FROM nodes').get() as { c: number }).c,
-      migrations: (db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c,
-    };
-    expect(after).toEqual(before);
+    expect(report.kind).toBe('DRY_RUN_REPORT');
+    expect(report.text).toMatch(/未执行任何数据库写操作/);
+    expect(report.unmapped).toEqual([]);
+    expect(snapshot(db)).toEqual(before);
   });
 
   it('acceptDefaultScopeMapping + dryRun → 仍不写库', () => {
     insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1' });
-    let err: Error | null = null;
-    try {
-      runMigrations(db, {
-        legacyOwnerId: 'user-legacy',
-        acceptDefaultScopeMapping: true,
-        dryRun: true,
-      });
-    } catch (e) {
-      err = e as Error;
-    }
-    expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
+    const before = snapshot(db);
 
-    const cols = (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name);
-    expect(cols).not.toContain('owner_id');
+    const report = runMigrations(db, {
+      legacyOwnerId: 'user-legacy',
+      acceptDefaultScopeMapping: true,
+      dryRun: true,
+    }) as any;
+
+    expect(report.kind).toBe('DRY_RUN_REPORT');
+    expect(snapshot(db)).toEqual(before);
   });
 
-  it('空库 + dryRun → 报告并在不写库的情况下返回', () => {
-    let err: Error | null = null;
-    try {
-      runMigrations(db, { dryRun: true });
-    } catch (e) {
-      err = e as Error;
-    }
-    expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/DRY_RUN_REPORT/);
-    expect((db.prepare('SELECT COUNT(*) c FROM schema_migrations').get() as { c: number }).c).toBe(1);
+  it('部分映射 + dryRun → 报告中列出未映射记录', () => {
+    insertLegacy(db, { node_id: 'mem-1', revision_id: 'rev-1' });
+    insertLegacy(db, { node_id: 'mem-2', revision_id: 'rev-2' });
+
+    const report = runMigrations(db, {
+      legacyOwnerId: 'user-legacy',
+      dryRun: true,
+      legacyScopeManifest: { 'rev-1': { layer: 'global', visibility: 'all_agents' } },
+    }) as any;
+
+    expect(report.kind).toBe('DRY_RUN_REPORT');
+    expect(report.mappedCount).toBe(1);
+    expect(report.unmapped).toEqual(['rev-2']);
+  });
+});
+
+describe('P1-D — 真正全新数据库 dryRun 零写入', () => {
+  it('完全空库（无 nodes、无 schema_migrations）+ dryRun → 不建任何表', () => {
+    const fresh = new DatabaseSync(':memory:');
+    const tablesBefore = (fresh.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
+      name: string;
+    }[]).map(t => t.name);
+    expect(tablesBefore).toEqual([]);
+
+    const report = runMigrations(fresh, { dryRun: true }) as any;
+    expect(report.kind).toBe('DRY_RUN_REPORT');
+    expect(report.isFreshDatabase).toBe(true);
+    expect(report.appliedVersions).toEqual([]);
+    expect(report.pendingVersions).toEqual([1, 2, 3]);
+
+    // 关键断言：一条迁移都没跑，schema_migrations 都没建
+    const tablesAfter = (fresh.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
+      name: string;
+    }[]).map(t => t.name);
+    expect(tablesAfter).toEqual([]);
+    fresh.close();
   });
 });
