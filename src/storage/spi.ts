@@ -1,9 +1,13 @@
-/** Storage SPI v2（Review R2 修订）
+/** Storage SPI v3（Review R3 修订）
  *
- *  与 R1 的差异：
- *  - **所有读写方法都必须携带 AuthContext**（无授权即失败关闭，P0-A/P0-B）
- *  - `get` 的 auth 不再可选；内部无授权读取改由 `unsafeInternalGet` 显式命名（不对外暴露）
- *  - 写操作按能力位校验（P0-B）
+ *  与 R2 的差异（R3-04）：
+ *  - **无授权内部方法（unsafeInternalGet / reconcile）已移出此公开接口**，
+ *    放入 `maintenance.ts` 的 `MaintenanceApi`，仅供受信任服务层/运维使用。
+ *  - 本文件只保留**必须经过 AuthContext** 的业务读写能力。
+ *
+ *  R2 保留：
+ *  - 所有读写方法强制 AuthContext（无授权即失败关闭）
+ *  - 写操作按能力位校验
  */
 import type { MemoryNode, Edge, OutboxEntry, NodeId, RevisionId, ContentHash, TxResult } from './types.ts';
 import type { AuthContext } from '../auth/context.ts';
@@ -66,10 +70,9 @@ export interface StorageProvider {
 
   graphTraverse(from: NodeRef, budget: TraverseBudget, auth: AuthContext): Promise<Subgraph>;
   vectorSearch(v: Float32Array, budget: number, auth: AuthContext): Promise<Hit[]>;
-  blobRef(hash: ContentHash): Promise<BlobHandle>;
 
-  /** 仅供存储层内部与迁移使用；**不暴露给服务层以上任何调用者** */
-  unsafeInternalGet(ref: NodeRef, opts?: { includeArchived?: boolean }): Promise<MemoryNode | null>;
+  /** 返回主区 blob 定位（R3-04：仅供内部写入路径与恢复路径使用，不向不可信调用方暴露）。 */
+  blobRef(hash: ContentHash): Promise<BlobHandle>;
 }
 
 /** StorageTx：事务与生命周期（全部需要授权） */
@@ -90,7 +93,4 @@ export interface StorageTx extends StorageProvider {
 
   /** 硬擦除：需 memory:purge 能力；操作者写入 Ledger */
   purge(nodeId: NodeId, auth: AuthContext, reasonCategory: string, cas: Cas): Promise<TxResult>;
-
-  /** 启动对账：清理节点、两类边、sensitivity_overlay、Outbox 残留 */
-  reconcile(): Promise<{ fixed: number }>;
 }
