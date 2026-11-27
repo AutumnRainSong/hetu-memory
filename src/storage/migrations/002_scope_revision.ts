@@ -99,7 +99,7 @@ export const migration = {
   ) => {
     const legacy = inspectLegacy(db);
 
-    // ── P1-C：dryRun 在任何条件下都不得写库（统一前置拦截）──
+    // ── dryRun 已由 Runner 最外层拦截（P1-D）；此处为纵深防御 ──
     if (opts.dryRun) {
       const total = (db.prepare('SELECT COUNT(*) AS c FROM nodes').get() as { c: number }).c;
       const mapped = Object.keys(opts.legacyScopeManifest ?? {});
