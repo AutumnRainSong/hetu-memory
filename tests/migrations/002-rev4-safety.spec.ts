@@ -290,7 +290,7 @@ describe('P1-D — 真正全新数据库 dryRun 零写入', () => {
     expect(report.kind).toBe('DRY_RUN_REPORT');
     expect(report.isFreshDatabase).toBe(true);
     expect(report.appliedVersions).toEqual([]);
-    expect(report.pendingVersions).toEqual([1, 2, 3]);
+    expect(report.pendingVersions).toEqual([1, 2, 3, 4]);
 
     // 关键断言：一条迁移都没跑，schema_migrations 都没建
     const tablesAfter = (fresh.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
