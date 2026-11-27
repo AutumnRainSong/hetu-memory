@@ -1,9 +1,11 @@
 /** Blob 存储：主区 + 归档区，真实文件读写 + Hash 校验 + 路径逃逸防护。
  *
- *  R2 P0-C 修复要点：
- *  - Minimize 必须真正把内容写入归档文件（而不是要求调用方预先写好）
- *  - Revive 必须真正读回归档内容、校验 Hash、恢复到主区
- *  - 所有路径必须限制在 root 内（拒绝 ../ 与符号链接逃逸）
+ *  R3-02 修复要点（符号链接防护）：
+ *  - 不是"操作完成后检查"，而是**写/读/删前**逐级解析父目录，确保每个组件不逃逸 root
+ *  - `secureResolve` 在写入前对存在的每个父目录做 realpath，符号链接目标必须在 root 内
+ *  - 符号链接一检测到逃逸立即抛错，目标目录不被触碰
+ *
+ *  R3-01 依赖：新增 `remove` 幂等（purgelist 使用）。
  */
 import {
   mkdir,
@@ -12,9 +14,10 @@ import {
   unlink,
   realpath,
   access,
+  lstat,
 } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
+import { dirname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 
 export class BlobPathError extends Error {
   readonly code = 'PERMISSION_DENIED';
@@ -44,9 +47,14 @@ export const sha256 = (buf: Buffer | string): string =>
   'sha256:' + createHash('sha256').update(buf).digest('hex');
 
 export class BlobStore {
-  constructor(private readonly root: string) {}
+  private readonly realRootPath: string;
 
-  /** 把相对引用解析为绝对路径，并保证不逃逸出 root */
+  constructor(private readonly root: string) {
+    // 根目录本身的真实路径（避免 root 自身是符号链接）
+    this.realRootPath = root;
+  }
+
+  /** 词法检查：相对引用不得逃逸（不含符号链接解析） */
   resolve(ref: string): string {
     if (!ref || isAbsolute(ref)) throw new BlobPathError(`BLOB_PATH_REJECTED: 非法引用 ${ref}`);
     const normalized = normalize(ref).replace(/\\/g, '/');
@@ -54,7 +62,6 @@ export class BlobStore {
       throw new BlobPathError(`BLOB_PATH_REJECTED: 引用包含路径穿越 ${ref}`);
     }
     const abs = join(this.root, normalized);
-    // 静态检查：abs 必须位于 root 之下
     const rel = relative(this.root, abs);
     if (rel.startsWith('..') || isAbsolute(rel)) {
       throw new BlobPathError(`BLOB_PATH_REJECTED: 引用逃逸出 Blob 根目录 ${ref}`);
@@ -62,18 +69,46 @@ export class BlobStore {
     return abs;
   }
 
-  /** 写入内容并返回其 Hash（主区/归档区共用） */
-  async write(ref: string, content: Buffer | string): Promise<string> {
+  /**
+   * 安全解析（R3-02）：在**任何文件操作前**调用。
+   * 逐级解析目标路径的每个父目录组件，若存在符号链接且其真实目标逃逸出 root 则立即拒绝。
+   * 不依赖"操作后再检查"。
+   */
+  async secureResolve(ref: string): Promise<string> {
     const abs = this.resolve(ref);
+    // 从 root 向下逐段解析存在的目录组件
+    let cursor = this.realRootPath;
+    const relParts = normalize(relative(this.realRootPath, abs)).split(sep).filter(Boolean);
+    for (const part of relParts.slice(0, -1)) {
+      cursor = join(cursor, part);
+      try {
+        await lstat(cursor);
+        const real = await realpath(cursor);
+        const relCheck = relative(this.realRootPath, real);
+        if (relCheck.startsWith('..') || isAbsolute(relCheck)) {
+          throw new BlobPathError(`BLOB_PATH_REJECTED: 目录组件为逃逸符号链接 ${ref} (${cursor})`);
+        }
+        cursor = real; // 用真实路径继续，防嵌套符号链接
+      } catch (e) {
+        if (e instanceof BlobPathError) throw e;
+        // 目录不存在：继续词法检查（mkdir 会创建）
+      }
+    }
+    return abs;
+  }
+
+  /** 写入内容并返回其 Hash（主区/归档区共用）；写前做符号链接安全解析 */
+  async write(ref: string, content: Buffer | string): Promise<string> {
+    const abs = await this.secureResolve(ref);
     await mkdir(dirname(abs), { recursive: true });
     const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
     await writeFile(abs, buf);
     return sha256(buf);
   }
 
-  /** 读取内容；不存在抛 BlobMissingError */
+  /** 读取内容；不存在抛 BlobMissingError；读前做符号链接安全解析 */
   async read(ref: string): Promise<Buffer> {
-    const abs = this.resolve(ref);
+    const abs = await this.secureResolve(ref);
     try {
       return await readFile(abs);
     } catch {
@@ -95,19 +130,26 @@ export class BlobStore {
 
   async exists(ref: string): Promise<boolean> {
     try {
-      await access(this.resolve(ref));
+      await access(await this.secureResolve(ref));
       return true;
     } catch {
       return false;
     }
   }
 
-  /** 删除（忽略不存在） */
+  /** 删除（幂等，忽略不存在）；删前做符号链接安全解析 */
   async remove(ref: string): Promise<void> {
+    const abs = await this.secureResolve(ref);
     try {
-      await unlink(this.resolve(ref));
-    } catch {
-      /* 不存在视为已删除 */
+      const st = await lstat(abs);
+      if (st.isSymbolicLink()) {
+        // 目标文件本身是符号链接 → 拒绝删除（防止删除外部文件）
+        throw new BlobPathError(`BLOB_PATH_REJECTED: 拒绝删除符号链接 ${ref}`);
+      }
+      await unlink(abs);
+    } catch (e) {
+      if (e instanceof BlobPathError) throw e;
+      /* 其他错误（不存在等）视为已删除 */
     }
   }
 
@@ -123,21 +165,5 @@ export class BlobStore {
     const safe = (s: string) =>
       s.replace(/[^A-Za-z0-9_-]/g, '_').replace(/_{2,}/g, '_').replace(/^_+|_+$/g, '') || 'unnamed';
     return `archive/${safe(nodeId)}/${safe(revisionId)}.txt`;
-  }
-
-  /** 校验一个路径真实解析后仍在 root 内（防符号链接逃逸） */
-  async assertInsideRoot(ref: string): Promise<void> {
-    const abs = this.resolve(ref);
-    try {
-      const real = await realpath(abs);
-      const realRoot = await realpath(this.root);
-      const rel = relative(realRoot, real);
-      if (rel.startsWith('..') || isAbsolute(rel)) {
-        throw new BlobPathError(`BLOB_PATH_REJECTED: 符号链接逃逸 ${ref}`);
-      }
-    } catch (e) {
-      if (e instanceof BlobPathError) throw e;
-      // 文件不存在时只需静态检查（已在 resolve 完成）
-    }
   }
 }
