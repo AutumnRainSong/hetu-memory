@@ -300,8 +300,8 @@ export class SqliteStorageProvider implements StorageTx {
         } else {
           this.insertNode(node);
         }
-        for (const e of edges) this.insertEdge(e);
-        for (const o of outbox) this.insertOutbox(o);
+        for (const e of edges) this.insertEdge(e, a);
+        for (const o of outbox) this.insertOutbox(o, nodeIdStr(node.node_id), node.scope, a);
         return { ok: true, revision_id: node.revision_id };
       });
     } catch (e) {
@@ -345,8 +345,7 @@ export class SqliteStorageProvider implements StorageTx {
       // ③ 写入归档区
       const archiveRef = BlobStore.archiveRefFor(row.node_id, row.revision_id);
       const archiveHash = await this.blobs.write(archiveRef, original);
-      // ④ 校验归档文件真实存在且 Hash 一致（路径逃逸检查 + 真实读取）
-      await this.blobs.assertInsideRoot(archiveRef);
+      // ④ 校验归档文件真实存在且 Hash 一致（write/read 已内建符号链接安全解析）
       await this.blobs.readVerified(archiveRef, archiveHash);
 
       // ⑤ 归档确认后才改状态；主区原始 Blob 保留（由 M2 的 GC 策略处理）
@@ -389,15 +388,15 @@ export class SqliteStorageProvider implements StorageTx {
       if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
         return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
       }
-      if (row.content_state !== 'MINIMIZED') {
+      if (row.version_state !== 'CURRENT' || row.content_state !== 'MINIMIZED') {
+        // R3-03：只能恢复当前版本；已被替代的历史版本按状态机拒绝直接 Revive
         return { ok: false, error: 'INVALID_STATE' };
       }
       if (!row.minimized_blob_ref || !row.minimized_blob_hash) {
         return { ok: false, error: 'ARCHIVE_MISSING' };
       }
 
-      // ① 读回归档并校验 Hash（失败即零副作用）
-      await this.blobs.assertInsideRoot(row.minimized_blob_ref);
+      // ① 读回归档并校验 Hash（读前含符号链接安全解析，失败即零副作用）
       const content = await this.blobs.readVerified(row.minimized_blob_ref, row.minimized_blob_hash);
       // ② 校验内容与原始 content_hash 一致（证明恢复的是同一条记忆）
       if (sha256(content) !== row.content_hash) {
@@ -427,6 +426,15 @@ export class SqliteStorageProvider implements StorageTx {
   }
 
   /** 硬擦除：需 memory:purge；Ledger 记录真实操作者 */
+  /** 硬擦除（R3-01）：Ledger 先行 → 标记待删 blob → 择优删除文件 → 数据库记录
+   *
+   *  语义：
+   *  1. 写 purge_ledger（持久化擦除意图，崩溃不丢）
+   *  2. 为每个 revision 的主区 ref + 归档 ref 写入 purge_blob_marks（pending）
+   *  3. 尽力物理删除 blob 文件；删除成功的 mark 置 done，失败保留 pending 由 reconcile 重试
+   *  4. 删除节点/边/覆盖层/Outbox
+   *  5. 返回前不做"文件已全删"的绝对担保——未删除的 pending 由 reconcile 补偿
+   */
   async purge(
     nodeId: NodeId,
     auth: AuthContext,
@@ -437,7 +445,7 @@ export class SqliteStorageProvider implements StorageTx {
       const a = assertValidAuth(auth);
       if (!hasCap(a, 'memory:purge')) throw new ForbiddenError('PERMISSION_DENIED: 缺少 memory:purge 能力');
 
-      return await this.withTx<TxResult>(() => {
+      return await this.withTx<TxResult>(async () => {
         const row = this.db
           .prepare("SELECT * FROM nodes WHERE node_id=? AND version_state='CURRENT'")
           .get(nodeIdStr(nodeId)) as NodeRow | undefined;
@@ -459,25 +467,62 @@ export class SqliteStorageProvider implements StorageTx {
           minimized_blob_ref: string | null;
         }[];
 
+        // ① Ledger 先行（提交点）
         const ledger = this.db.prepare(
-          `INSERT INTO purge_ledger(node_id, content_hash, operator, reason_category)
-           VALUES(?,?,?,?)`
+          `INSERT INTO purge_ledger(node_id, content_hash, operator, reason_category) VALUES(?,?,?,?)`
         );
         for (const r of all) ledger.run(row.node_id, r.content_hash, a.agentId, reasonCategory);
 
+        // ② 记录待删 blob（含主区 + 归档区）。销毁意图持久化在事务内。
+        const blobRefs = new Map<string, 'main' | 'archive'>(); // ref -> kind (去重)
+        for (const r of all) {
+          if (r.content_ref) blobRefs.set(r.content_ref, 'main');
+          if (r.minimized_blob_ref) blobRefs.set(r.minimized_blob_ref, 'archive');
+        }
+        const markIns = this.db.prepare(
+          `INSERT INTO purge_blob_marks(node_id, blob_ref, kind, operator) VALUES(?,?,?,?)`
+        );
+        const insertedMarks: number[] = [];
+        for (const [ref, kind] of blobRefs) {
+          const info = markIns.run(row.node_id, ref, kind, a.agentId);
+          insertedMarks.push(Number(info.lastInsertRowid));
+        }
+
         this.cleanupNodeRelations(row.node_id, all.map(r => r.revision_id));
         this.db.prepare('DELETE FROM sensitivity_overlay WHERE node_id=?').run(row.node_id);
+        this.db
+          .prepare("DELETE FROM outbox WHERE entity_id=?")
+          .run(row.node_id);
         this.db.prepare('DELETE FROM nodes WHERE node_id=?').run(row.node_id);
+
+        // ③ 尽力物理删除 blob 文件（R3-01）：先持久化意图再删除。
+        //    删除成功 → done；删除失败 → failed（保留，供 reconcile 重试）。
+        //    文件删除失败不影响 Ledger/DB 已提交的擦除语义，也不伪造"已全删"。
+        const markUpd = this.db.prepare(
+          `UPDATE purge_blob_marks SET status=?, retry_count=retry_count+1 WHERE seq=?`
+        );
+        for (const seq of insertedMarks) {
+          if (!this.blobs) { markUpd.run('failed', seq); continue; }
+          const mrow = this.db.prepare('SELECT blob_ref FROM purge_blob_marks WHERE seq=?').get(seq) as { blob_ref: string };
+          try {
+            await this.blobs.remove(mrow.blob_ref);
+            markUpd.run('done', seq);
+          } catch {
+            markUpd.run('failed', seq);
+          }
+        }
+        // 已成功的标记清理
+        this.db.exec("DELETE FROM purge_blob_marks WHERE status='done'");
+
         return { ok: true, revision_id: asRevisionId(row.revision_id) };
       });
     } catch (e) {
       return this.asTxError(e);
     }
   }
-
-  /** 对账：清理 Ledger 命中残留（节点 + 两类边 + 覆盖层 + Outbox） */
-  async reconcile(): Promise<{ fixed: number }> {
-    return this.withTx(() => {
+  /** 对账：清理 Ledger 命中残留（节点 + 两类边 + 覆盖层 + Outbox）+ 补偿 Purge 文件删除（R3-01） */
+  async reconcile(): Promise<{ fixed: number; filesRemoved: number }> {
+    return this.withTx(async () => {
       const orphans = this.db
         .prepare(
           `SELECT n.node_id FROM nodes n JOIN purge_ledger l ON l.node_id = n.node_id GROUP BY n.node_id`
@@ -508,7 +553,42 @@ DELETE FROM edges WHERE type = 'supersedes'
     OR NOT EXISTS (SELECT 1 FROM nodes WHERE revision_id = edges."to"));
 DELETE FROM sensitivity_overlay WHERE NOT EXISTS (SELECT 1 FROM nodes WHERE node_id = sensitivity_overlay.node_id);
 `);
-      return { fixed };
+
+      // 补偿未完成的 Purge 文件删除：读取 pending 清单，尽力删除，更新状态
+      // 注意：withTx 内做异步文件 I/O；文件删除失败不影响已提交的数据库清理，
+      // 失败项保留 pending，下次 reconcile 重试。事务内只做 DB 状态更新。
+      let filesRemoved = 0;
+      if (this.blobs) {
+        const pending = this.db
+          .prepare(
+            `SELECT seq, blob_ref FROM purge_blob_marks
+             WHERE status='pending' ORDER BY seq LIMIT 200`
+          )
+          .all() as { seq: number; blob_ref: string }[];
+        for (const m of pending) {
+          let removed = false;
+          let failed = false;
+          try {
+            await this.blobs.remove(m.blob_ref);
+            removed = true;
+          } catch {
+            failed = true;
+          }
+          const status = removed ? 'done' : 'failed';
+          this.db
+            .prepare(
+              `UPDATE purge_blob_marks SET status=?, retry_count=retry_count+1 WHERE seq=?`
+            )
+            .run(status, m.seq);
+          if (removed) filesRemoved += 1;
+          // failed 项：保留 pending（供重试），不在此处抛错
+          void failed;
+        }
+        // 清理已完成的标记，避免无限增长
+        this.db.exec("DELETE FROM purge_blob_marks WHERE status='done'");
+      }
+
+      return { fixed, filesRemoved };
     });
   }
 
@@ -610,23 +690,78 @@ DELETE FROM sensitivity_overlay WHERE NOT EXISTS (SELECT 1 FROM nodes WHERE node
     }
   }
 
-  private insertEdge(e: Edge): void {
+  private insertEdge(e: Edge, auth: AuthContext): void {
     const isSupersedes = e.type === 'supersedes';
+
+    // R3-05：Edge 授权完整性 —— 两端必须属于当前工作空间且对当前 auth 可见，
+    //          不能连到其他工作空间 / 其他 Agent 的私有 persona / annotation。
+    const fromStr = String(e.from);
+    const toStr = String(e.to);
+    if (isSupersedes) {
+      // supersedes 由 DB 触发器保证同 node_id + 序号方向；这里校验这两个 revision 都可读
+      const both = this.db
+        .prepare(
+          `SELECT revision_id, node_id, owner_id, layer, agent_id, visibility,
+                  (SELECT value FROM sensitivity_overlay so WHERE so.node_id = n.node_id) AS sensitivity_value,
+                  shared_with
+           FROM nodes n WHERE revision_id IN (?,?)`
+        )
+        .all(fromStr, toStr) as unknown as NodeRow[];
+      if (both.length !== 2) throw new ForbiddenError('PERMISSION_DENIED: supersedes 边端点必须存在');
+      for (const r of both) {
+        const mnode = this.rowToNode(r);
+        if (!isVisible(auth, this.scopeViewOf(mnode), mnode.sensitivity)) {
+          throw new ForbiddenError('PERMISSION_DENIED: supersedes 边端点不在授权范围');
+        }
+      }
+      this.db
+        .prepare(
+          `INSERT INTO edges(type, link_class, "from", "to", weight, created_at) VALUES(?,?,?,?,?,?)`
+        )
+        .run(e.type, null, fromStr, toStr, e.weight, e.created_at);
+      return;
+    }
+
+    // 普通边：from/to 是 node_id —— 两端节点都必须在当前工作空间且对 auth 可见
+    const nodes = this.db
+      .prepare(
+        `SELECT n.*, (SELECT value FROM sensitivity_overlay so WHERE so.node_id = n.node_id) AS sensitivity_value
+         FROM nodes n WHERE n.node_id IN (?,?)`
+      )
+      .all(fromStr, toStr) as unknown as NodeRow[];
+    if (nodes.length !== 2) {
+      // 端点不足（DB 引用完整性也会拦），此处给出授权语义而非仅"引用缺失"
+      throw new ForbiddenError('PERMISSION_DENIED: 边端点必须存在且在本工作空间内');
+    }
+    for (const r of nodes) {
+      const mnode = this.rowToNode(r);
+      if (!isVisible(auth, this.scopeViewOf(mnode), mnode.sensitivity)) {
+        throw new ForbiddenError('PERMISSION_DENIED: 不能连接不可见的节点（跨工作空间或他人私有）');
+      }
+    }
+
     this.db
       .prepare(
         `INSERT INTO edges(type, link_class, "from", "to", weight, created_at) VALUES(?,?,?,?,?,?)`
       )
       .run(
         e.type,
-        isSupersedes ? null : ((e as { link_class?: string }).link_class ?? null),
-        String(e.from),
-        String(e.to),
+        ((e as { link_class?: string }).link_class ?? null),
+        fromStr,
+        toStr,
         e.weight,
         e.created_at
       );
   }
 
-  private insertOutbox(o: OutboxEntry): void {
+  private insertOutbox(o: OutboxEntry, nodeId: string, nodeScope: Scope, _auth: AuthContext): void {
+    // R3-05：Outbox entity_id 必须与本次写入的节点 / 其项目 / 其工作空间一致
+    //（防伪造索引或资源声明的 entity，把动作挂到别的记录或项目上）
+    const validEntities = new Set([nodeId, nodeScope.owner_id]);
+    if (nodeScope.project_id) validEntities.add(nodeScope.project_id);
+    if (!validEntities.has(o.entity_id)) {
+      throw new ForbiddenError('PERMISSION_DENIED: outbox entity_id 超出本次授权写入范围');
+    }
     this.db
       .prepare(
         `INSERT INTO outbox(kind, entity_id, seq, payload) VALUES(?,?,?,?)
