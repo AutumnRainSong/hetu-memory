@@ -62,9 +62,15 @@ describe('Migration 002 Rev3 — 回滚（任务 C）', () => {
   it('表结构快照：回滚前后表集合一致（无残留临时表）', () => {
     runMigrations(db);
     const before = Object.keys(columnSnapshot(db)).sort();
+    // 回滚 004 时 purge_blob_marks 应被删除，但 001 的基本表保留
+    expect(before).toContain('purge_blob_marks');
     rollbackTo(db, 1);
     const after = Object.keys(columnSnapshot(db)).sort();
-    expect(after).toEqual(before);
+    // 004 表已随回滚删除
+    expect(after).not.toContain('purge_blob_marks');
+    // 001 核心表仍存在
+    for (const t of ['nodes','edges','outbox','purge_ledger','sensitivity_overlay','raw_events','schema_migrations'])
+      expect(after).toContain(t);
     expect(after).not.toContain('nodes_rev1');
     expect(after).not.toContain('nodes_rev3');
   });
