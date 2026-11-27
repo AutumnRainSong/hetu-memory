@@ -127,20 +127,25 @@ sequenceDiagram
 
 ## 当前真实进度
 
-> 最后更新：2026-11-25 · commit `29c4d2b`
+> 最后更新：2026-11-27 · 分支 `fix/review-r3`（Review R3 定点修订中）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| 设计 | 主规格 v1.4 收敛定稿（11 轮审查协商） | ✅ 完成 |
+| 设计 | 主规格 **v1.5** 定稿（ADR 显式修订 v1.4） | ✅ 完成 |
 | **M0** | 工程骨架、CI、六项 P0 决策（DDR） | ✅ 完成 |
-| **M1-A** | 数据模型：Scope 持久化、RevisionId 分离、安全迁移 | 🔧 Rev3 已交付，**待 Rev4 收尾验收** |
-| **M1-B** | SQLite Storage Engine（CAS / 事务 / Outbox） | ⏳ 未开始（M1-A 验收后启动） |
-| **M1-C** | Remember → Persist → Recall 业务闭环 | ⏳ 未开始 |
+| **M1-A** | 数据模型：Scope 持久化、RevisionId 分离、安全迁移 | ✅ Rev4 验收中（R2/R3 修订已完成） |
+| **M1-B** | SQLite Storage Engine（CAS / 事务 / Outbox / 生命周期） | 🔧 已实现，**Review R3 定点修订中（未合并 main）** |
+| **M1-C** | Remember → Persist → Recall 业务闭环 + Token 验证 + 权限执行链 | ⏳ R3 验收通过后启动 |
 | **M2** | 生命周期（Minimize / Forget / Purge） | ⏳ 未开始 |
 | **M3** | 后台可靠性（RAW / Digest / 背压） | ⏳ 未开始 |
 | **M4** | 洛书 / Proposal / 讨论裁决 / Embedding / 发布 | ⏳ 未开始 |
 
-**工程现状**：7 个测试文件、60 项测试通过；CI（lint + tsc + vitest）通过。存储引擎（StorageProvider 真实实现）尚未完成——当前只有接口定义、数据模型与迁移。
+**工程现状**：13 个测试文件、**153 项测试通过**；CI（lint + tsc + 类型契约 + vitest + 依赖审计）通过，`npm audit` 0 漏洞。
+存储引擎已实现并通过 R2/R3 修订（`SqliteStorageProvider`：强制 AuthContext 失败关闭、Sensitivity SQL 前置硬过滤、shared_list 白名单、
+能力位写授权、真实 Blob 归档/恢复的字节级闭环、符号链接逃逸防护、**Purge 物理删除文件并有 reconcile 补偿**、Edge/Outbox 写入授权）。
+**178 项测试全绿**，含多身份端到端安全测试与 R3 生命周期并发/文件删除/符号链接专项测试。
+
+**尚未实现（明确边界）**：Token 解析、会话绑定、项目成员关系查询（M1-C）；主区 Blob 的 GC 策略（M2）；Proposal/讨论裁决（M4）。
 
 ## 研发路线
 

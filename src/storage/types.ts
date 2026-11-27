@@ -95,7 +95,9 @@ export interface OutboxEntry {
   payload?: unknown;
 }
 
-export type ErrorCodeName = 'STATE_CONFLICT' | 'PURGED_FINAL' | 'STUB_IMMUTABLE' | 'ARCHIVE_MISSING' | 'INVALID_STATE' | 'QUOTA_HARD_LIMIT' | 'PERMISSION_DENIED' | 'WRITE_PAUSED' | 'MARKER_CONFLICT' | 'CAS_CONFLICT';
+/** 错误码类型从注册表派生（单一事实源，避免接口与实现漂移） */
+export type { ErrorCode as ErrorCodeName } from '../errors/registry.ts';
+import type { ErrorCode } from '../errors/registry.ts';
 export type TxResult =
   | { ok: true; revision_id: RevisionId }
-  | { ok: false; error: ErrorCodeName; currentRevision?: RevisionId };
+  | { ok: false; error: ErrorCode; currentRevision?: RevisionId };

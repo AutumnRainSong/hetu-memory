@@ -1,7 +1,17 @@
-# 河图 HeTu · 通用 Agent 记忆模块 —— 架构规格 v1.4（定稿）
+# 河图 HeTu · 通用 Agent 记忆模块 —— 架构规格 v1.5（定稿）
+## 变更记录（ADR）
+
+| 版本 | 日期 | 变更 | 影响范围 |
+|---|---|---|---|
+| **v1.5** | 2026-11-26 | **多 Agent 工作空间共享模型正式化**：① `owner_id` 正式定义为**工作空间边界**（一个用户/组织），不是 Agent ID；② 新增 `AuthContext`（ownerId / agentId / projectIds / canReadGlobal）作为查询的**强制授权上下文**，缺失即失败关闭（`PERMISSION_DENIED`）；③ `agent_persona` 与 `private_annotation` **强制 `visibility='owner'`**（DB CHECK + UPDATE 触发器双重保证，业务代码不可绕过）；④ 边引用完整性下沉 DB 触发器（普通边端点=node_id，supersedes 端点=revision_id，重复边拒绝覆盖） | 与 v1.4「多用户暂不实现、owner_id 仅预留」的表述不同。工作空间共享已进入实现基线。Proposal / Discussion / Decision 协作机制仍属 M4 |
+| v1.4 | 2026-11-23 | 收敛定稿（双维度状态机、删除三操作、Purge Ledger、权限前置硬过滤、五类归属、Embedding Worker、候选预算、性能标准） | — |
+
+> 设计修订遵循"不静默改变旧结论"：上表 v1.5 是对 v1.4 的**显式修订**，v1.4 原文保留可追溯。
+
+
 
 > **名实**：系统 **河图 HeTu**（"河出图"——龙马负出的那张最早的图，点即节点、位势即边）
-> **版本**：v1.4 收敛定稿（唯一工程基线；收敛报告产出已全部并入本文件，不再存在 v1.5）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
+> **版本**：v1.5（唯一工程基线；v1.5 相对 v1.4 的修订见上方 ADR）· 2026-11-23 · 10 轮审查协商闭环（红队×4 / 复核×1 / 致命专项×1 / 外部评审×2 / 工程协商×2 / 收敛终审×1）
 > 收敛依据：docs/reviews/hetu-v1-convergence-analysis.md 与 docs/reviews/convergence-v15-report.md（五项专项：P0-1/P0-2/P0-3/P1-4/P1-5）
 > **状态**：设计冻结。本版本为团队实现的唯一依据；此后设计变更一律走"提案 → 用户/评审确认 → 文档先行 → 代码跟进"。
 > **配套**：洛书 Luoshu 交换格式（第 7 节）· continue_bro.md（AI 结对入职）· 执行者.md（团队画像）
@@ -12,7 +22,8 @@
 
 - **定位**：跨框架通用记忆层——任何 agent 框架（Claude Code / Cursor / DSH / 自研）均可接入，一份记忆处处可用
 - **理念**：本地优先、数据归用户（洛书开放格式）；记忆是活的图谱；**内容用户掌生杀权，系统掌结构整理权**
-- **明确不做（MVP）**：跨设备同步 / 云托管 / 多用户（owner_id 预留）/ 具身实现（JSON 扩展位）/ 内置大模型
+- **明确不做（MVP）**：跨设备同步 / 云托管 / 具身实现（JSON 扩展位）/ 内置大模型
+  - ~~多用户（owner_id 预留）~~ → **v1.5 修订**：`owner_id` 已正式定义为**工作空间边界**，多 Agent 共享同一工作空间已进入实现基线（见上方 ADR 与 §1.3）。仍不做：跨组织 / 跨租户 / 互联网范围的全局共享
 - **P2 延后项（设计已留接口，不进本轮）**：图谱扩散 / 边衰减 GC / LLM 消歧 / 反思 SCHEDULED 模式 / 实体自动合并 / 多租户
 
 ---
@@ -41,8 +52,48 @@
 │   链尾唯一性：存储层条件写 + 确定性 tie-break               │
 │   graph-traverse 契约：hub 抑制 / 扩散预算 / 超时降级       │
 ├ 扩展层（预留接口，不实现）───────────────────────────────┤
-│ 具身（JSON 扩展位）/ 跨设备同步 / 云托管 / 多用户 owner_id  │
+│ 具身（JSON 扩展位）/ 跨设备同步 / 云托管                    │
 └────────────────────────────────────────────────────────┘
+
+### 1.3 授权模型与敏感级过滤（v1.5 新增，替代 v1.4 的 owner_id 预留说明）
+
+**身份与边界**
+
+| 概念 | 含义 | 不是什么 |
+|---|---|---|
+| `owner_id` | 工作空间边界（一个用户或一个组织） | **不是** Agent ID，不是单个记忆的创建者 |
+| `agent_id` | 人格 / 私有注解的归属对象 | 不是权限边界 |
+| `project_id` | 项目共享空间 | 不是用户私有空间 |
+| `provenance.agent_id` | 内容的实际贡献者（审计） | 不代表当前请求身份 |
+
+**AuthContext**（由经 Token 验证的服务层构造，存储层只接受不推断）
+
+```
+ownerId         工作空间边界
+agentId         当前 Agent 身份
+projectIds      经可信成员关系验证的项目集
+canReadGlobal   是否可读工作空间 global 层
+maxSensitivity  可读敏感级上限
+capabilities    写能力位（write/supersede/minimize/revive/purge）
+```
+
+**可见性规则**（`get` 与 `query` 共用同一套 `isVisible()`）
+
+1. **工作空间：** `scope.owner_id` 必须等于 `auth.ownerId`（绝对隔离）
+2. **敏感级硬过滤：** `sensitivity_overlay` 值超出 `maxSensitivity` 即不进入候选（SQL 层完成，**不是排序因子**）
+3. **层可见性：**
+   - `user_identity` → 当前工作空间内可见
+   - `project` → `project_id ∈ auth.projectIds`（成员关系验证，非客户端自述）
+   - `global` → 需 `canReadGlobal`
+   - `agent_persona` / `private_annotation` → 仅 `agent_id === auth.agentId`
+4. **visibility 语义：**
+   - `owner` / `project_agents` / `all_agents`：按层规则已约束
+   - `shared_list`：**必须** `shared_with.includes(auth.agentId)`（项目成员 ≠ 白名单成员）
+5. **不可见 = 不存在：** `get` 返回 `null`，`query` 不返回该条，不泄露存在性
+
+**写权限：** `put` / `minimize` / `revive` / `purge` 分别需 `memory:write` / `memory:minimize` / `memory:revive` / `memory:purge` 能力位；写入 `owner_id` / `agent_id` 必须与 `auth` 一致；`purge_ledger.operator` 记录**真实操作者**。
+
+**能力边界**：`AuthContext` 的 Token 解析、会话绑定与项目成员关系查询属 **M1-C**；存储层强制要求上下文完整且不可绕过，但不自行验证签名。
 
 ### 1.1 Storage SPI 事务与原子性契约（收敛 P0-3 补充）
 

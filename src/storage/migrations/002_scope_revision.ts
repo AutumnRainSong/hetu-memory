@@ -99,6 +99,31 @@ export const migration = {
   ) => {
     const legacy = inspectLegacy(db);
 
+    // ── dryRun 已由 Runner 最外层拦截（P1-D）；此处为纵深防御 ──
+    if (opts.dryRun) {
+      const total = (db.prepare('SELECT COUNT(*) AS c FROM nodes').get() as { c: number }).c;
+      const mapped = Object.keys(opts.legacyScopeManifest ?? {});
+      const revIds = (
+        db.prepare('SELECT revision_id FROM nodes').all() as { revision_id: string }[]
+      ).map(r => r.revision_id);
+      const unmapped = revIds.filter(id => !(id in (opts.legacyScopeManifest ?? {})));
+      throw new Error(
+        [
+          'DRY_RUN_REPORT（未执行任何数据库写操作）',
+          `总记录数：${total}`,
+          `显式映射条数：${mapped.length}`,
+          `未映射条数：${unmapped.length}${unmapped.length ? '（需提供 legacyScopeManifest 或 acceptDefaultScopeMapping）' : ''}`,
+          `superseded_by 待转换：${legacy.rows.length}（歧义 ${legacy.ambiguous.length} / 悬空 ${legacy.dangling.length}）`,
+          `历史环：${legacy.cycles.length}`,
+          `旧 owner 提供：${opts.legacyOwnerId ? '是' : '否'}`,
+          unmapped.length ? `待映射记录：\n  ${unmapped.slice(0, 20).join('\n  ')}` : '',
+          '如需执行，请在不设置 dryRun 的情况下重新调用。',
+        ]
+          .filter(Boolean)
+          .join('\n')
+      );
+    }
+
     // ── 任务 A3：历史 Revision 环必须中止（不能依赖迁移后的 UPDATE 触发器）──
     if (legacy.cycles.length) {
       throw new Error(

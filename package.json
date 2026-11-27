@@ -13,7 +13,8 @@
     "lint": "eslint src tests",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
     "migrate": "node --experimental-strip-types src/storage/migrate.ts",
-    "schema:check": "node scripts/validate-luoshu.mjs"
+    "schema:check": "node scripts/validate-luoshu.mjs",
+    "typecheck": "tsc -p tsconfig.typetest.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -1,11 +1,16 @@
-/** Storage SPI v1（主规格 §1.1 StorageTx 契约的实现接口）
- *  不变量（存储层强制，非应用层）：
- *  1. 链尾唯一：supersede 通过条件写保证单链
- *  2. 节点不可变：无 UPDATE content 路径，只有 INSERT 新 revision
- *  3. Purge Ledger 先行提交（提交点），级联删除崩溃后由启动对账补删
- *  4. Writer 队列单写者；多进程一致性由 SQLite WAL + busy_timeout + 条件写承载
+/** Storage SPI v3（Review R3 修订）
+ *
+ *  与 R2 的差异（R3-04）：
+ *  - **无授权内部方法（unsafeInternalGet / reconcile）已移出此公开接口**，
+ *    放入 `maintenance.ts` 的 `MaintenanceApi`，仅供受信任服务层/运维使用。
+ *  - 本文件只保留**必须经过 AuthContext** 的业务读写能力。
+ *
+ *  R2 保留：
+ *  - 所有读写方法强制 AuthContext（无授权即失败关闭）
+ *  - 写操作按能力位校验
  */
 import type { MemoryNode, Edge, OutboxEntry, NodeId, RevisionId, ContentHash, TxResult } from './types.ts';
+import type { AuthContext } from '../auth/context.ts';
 
 export interface Cas {
   expectedRevision: RevisionId;
@@ -31,38 +36,61 @@ export interface Hit {
 }
 
 export interface BlobHandle {
-  ref: string;      // 主区 blobs/<hash前缀>/<hash> 或归档区 archive/<node_id>/rev_N.txt
+  ref: string;
   hash: ContentHash;
   inArchive: boolean;
 }
 
-/** 六原语（v1.4 §1） */
+/** 查询标识：按逻辑记忆取 CURRENT，或按具体版本精确取 */
+export type NodeRef =
+  | { kind: 'node'; nodeId: NodeId }
+  | { kind: 'revision'; revisionId: RevisionId };
+
+/** StorageProvider（服务层调用；**不直接暴露给 Agent/MCP**）
+ *
+ *  授权契约：
+ *  - 每个方法都接收 AuthContext，由服务层在 Token 验证后构造
+ *  - 存储层只依据 AuthContext 判定，不信任任何调用方自述的 owner/agent
+ */
 export interface StorageProvider {
-  get(id: NodeId, opts?: { includeArchived?: boolean }): Promise<MemoryNode | null>;
-  put(node: MemoryNode, edges: Edge[], outbox: OutboxEntry[], cas?: Cas): Promise<TxResult>;
-  query(q: { text?: string; scope: Partial<MemoryNode['scope']> }): Promise<Hit[]>;
-  graphTraverse(from: NodeId, budget: TraverseBudget): Promise<Subgraph>; // MVP 阶段一: throw UNIMPLEMENTED
-  vectorSearch(v: Float32Array, budget: number): Promise<Hit[]>;          // MVP 阶段一: throw UNIMPLEMENTED
+  /** 读取（需授权）：不可见 → null（等同不存在，不泄漏存在性） */
+  get(ref: NodeRef, auth: AuthContext, opts?: { includeArchived?: boolean }): Promise<MemoryNode | null>;
+
+  /** 写入（需专门能力位）：owner/agent 必须与 auth 一致 */
+  put(
+    node: MemoryNode,
+    edges: Edge[],
+    outbox: OutboxEntry[],
+    auth: AuthContext,
+    cas?: Cas
+  ): Promise<TxResult>;
+
+  /** 查询（需授权）：权限 + 敏感级在 SQL 层前置过滤 */
+  query(q: { text?: string; scope?: Partial<MemoryNode['scope']> }, auth: AuthContext): Promise<Hit[]>;
+
+  graphTraverse(from: NodeRef, budget: TraverseBudget, auth: AuthContext): Promise<Subgraph>;
+  vectorSearch(v: Float32Array, budget: number, auth: AuthContext): Promise<Hit[]>;
+
+  /** 返回主区 blob 定位（R3-04：仅供内部写入路径与恢复路径使用，不向不可信调用方暴露）。 */
   blobRef(hash: ContentHash): Promise<BlobHandle>;
 }
 
-/** StorageTx：事务与原子操作（收敛 P0-3 补充，主规格 §1.1）
- *  - putWithRevision：Node+Revision+Edge+Outbox 同一事务原子提交
- *  - minimize：归档 blob 先写 → 单事务改 content_state/minimized_blob_ref → 主区 blob 延迟 GC
- *  - purge：两阶段——Ledger insert（提交点）→ 级联删除；崩溃后启动对账补删
- *  - revive：TOMBSTONE→FULL（归档校验）/ MINIMIZED→FULL（同）；语义见主规格 §3.1
- *  - 启动对账：reconcile() 幂等，任意崩溃序列收敛
- */
+/** StorageTx：事务与生命周期（全部需要授权） */
 export interface StorageTx extends StorageProvider {
   putWithRevision(
     node: MemoryNode,
     edges: Edge[],
     outbox: OutboxEntry[],
+    auth: AuthContext,
     cas?: Cas
   ): Promise<TxResult>;
-  minimize(id: NodeId, archive: BlobHandle, cas: Cas): Promise<TxResult>;
-  purge(id: NodeId, reasonCategory: string, cas: Cas): Promise<TxResult>;
-  revive(id: NodeId, cas: Cas): Promise<TxResult>;
-  /** 启动对账：Ledger 有而节点表有 → 补删；归档存在但状态非 MINIMIZED → 补完成。幂等。 */
-  reconcile(): Promise<{ fixed: number }>;
+
+  /** 精简：需 memory:minimize 能力 + 对目标可见 */
+  minimize(nodeId: NodeId, auth: AuthContext, cas: Cas): Promise<TxResult>;
+
+  /** 恢复：需 memory:revive 能力 + 对目标可见 */
+  revive(revisionId: RevisionId, auth: AuthContext, cas: Cas): Promise<TxResult>;
+
+  /** 硬擦除：需 memory:purge 能力；操作者写入 Ledger */
+  purge(nodeId: NodeId, auth: AuthContext, reasonCategory: string, cas: Cas): Promise<TxResult>;
 }
