@@ -7,6 +7,7 @@ import { DatabaseSync } from './sqlite.ts';
 import { migration as m001 } from './migrations/001_init.ts';
 import { migration as m002 } from './migrations/002_scope_revision.ts';
 import { migration as m003 } from './migrations/003_persona_private_edges.ts';
+import { migration as m004 } from './migrations/004_purge_blob_marks.ts';
 
 export type Db = InstanceType<typeof DatabaseSync>;
 
@@ -72,6 +73,7 @@ function inspectBeforeMigrate(db: Db, opts: MigrationOptions): DryRunReport {
   let pendingSuperseded: string[] = [];
   let ambiguous: string[] = [];
   let dangling: string[] = [];
+  let cycles: string[] = [];
   if (!isFreshDatabase) {
     const cols = (db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map(c => c.name);
     if (cols.includes('superseded_by') && !cols.includes('superseded_by_revision')) {
@@ -90,6 +92,29 @@ function inspectBeforeMigrate(db: Db, opts: MigrationOptions): DryRunReport {
         if (asNode) ambiguous.push(`${r.node_id}/${r.revision_id} -> ${r.superseded_by}`);
         else dangling.push(`${r.node_id}/${r.revision_id} -> ${r.superseded_by}`);
       }
+    }
+
+    // R3-06：复用 Migration 002 的历史环检测（读取归并到与真实迁移同一判定）
+    if (cols.includes('superseded_by') && !cols.includes('superseded_by_revision')) {
+      const chainMap = new Map<string, string>();
+      const all = db
+        .prepare('SELECT revision_id, superseded_by FROM nodes WHERE superseded_by IS NOT NULL')
+        .all() as { revision_id: string; superseded_by: string }[];
+      for (const r of all) chainMap.set(r.revision_id, r.superseded_by);
+      const seenCycles = new Set<string>();
+      for (const start of chainMap.keys()) {
+        const visit = new Set<string>();
+        let cur: string | undefined = start;
+        while (cur && chainMap.has(cur)) {
+          if (visit.has(cur)) {
+            seenCycles.add([...visit, cur].join(' -> '));
+            break;
+          }
+          visit.add(cur);
+          cur = chainMap.get(cur);
+        }
+      }
+      cycles = [...seenCycles];
     }
   }
 
@@ -120,7 +145,7 @@ function inspectBeforeMigrate(db: Db, opts: MigrationOptions): DryRunReport {
     legacySupersededPending: pendingSuperseded.length,
     ambiguous,
     dangling,
-    cycles: [],
+    cycles,
     legacyOwnerProvided: !!opts.legacyOwnerId,
     text,
   };
@@ -133,7 +158,7 @@ export interface Migration {
   down?: string | ((db: Db) => void);
 }
 
-export const MIGRATIONS: Migration[] = [m001 as Migration, m002 as Migration, m003 as Migration];
+export const MIGRATIONS: Migration[] = [m001 as Migration, m002 as Migration, m003 as Migration, m004 as Migration];
 
 function ensureMetaTable(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
