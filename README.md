@@ -127,7 +127,7 @@ sequenceDiagram
 
 ## 当前真实进度
 
-> 最后更新：2026-11-26 · 分支 `fix/review-r1`（Review R1 修订中）
+> 最后更新：2026-11-27 · 分支 `fix/review-r2`（Review R2 定点修订中）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -140,9 +140,12 @@ sequenceDiagram
 | **M3** | 后台可靠性（RAW / Digest / 背压） | ⏳ 未开始 |
 | **M4** | 洛书 / Proposal / 讨论裁决 / Embedding / 发布 | ⏳ 未开始 |
 
-**工程现状**：12 个测试文件、**126 项测试通过**；CI（lint + tsc + 类型契约 + vitest + 依赖审计）通过，`npm audit` 0 漏洞。
-存储引擎已实现（`SqliteStorageProvider`：CAS 三步链翻、事务原子性、Outbox 幂等、Scope 前置过滤、归档校验、Purge 全链清理），
-但**未经 Review R1 验收**，生命周期能力（Minimize/Revive/Purge）在真实归档验证完成前不得对外宣称可用。
+**工程现状**：13 个测试文件、**153 项测试通过**；CI（lint + tsc + 类型契约 + vitest + 依赖审计）通过，`npm audit` 0 漏洞。
+存储引擎已实现并通过 R2 修订（`SqliteStorageProvider`：强制 AuthContext 失败关闭、Sensitivity SQL 前置硬过滤、shared_list 白名单、
+能力位写授权、真实 Blob 归档/恢复的字节级闭环、路径逃逸防护、Purge 全链清理 + reconcile 完整对账）。
+另有 17 项**多身份端到端安全测试**（4 个不同 AuthContext 对同一批记忆读/写/改/删）。
+
+**尚未实现（明确边界）**：Token 解析、会话绑定、项目成员关系查询（M1-C）；主区 Blob 的 GC 策略（M2）；Proposal/讨论裁决（M4）。
 
 ## 研发路线
 
