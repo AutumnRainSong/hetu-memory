@@ -1,14 +1,17 @@
-/** SqliteStorageProvider —— Storage SPI / StorageTx 的真实 SQLite 实现（M1-B）
+/** SqliteStorageProvider v2（Review R2）
  *
- *  设计要点（对应主规格 §1.1 四条不变量）：
- *  1. 链尾唯一：supersede 走条件写（CAS），失败返回 CAS_CONFLICT + 当前 revision
- *  2. 节点不可变：只 INSERT 新 revision，绝不 UPDATE 内容字段（DB 触发器兜底）
- *  3. Purge Ledger 先行提交：purge() 在单事务内先写 Ledger 再级联删除；崩溃由 reconcile() 收敛
- *  4. 单写者：同一 provider 实例串行写；跨进程由 SQLite WAL + busy_timeout 承载
- *
- *  权限前置：query() 在 SQL 层就带上 scope 条件，绝不"先全量召回再过滤"。
+ *  核心变化（相对 R1）：
+ *  - **每个读写方法都强制 AuthContext**；无授权即抛 AuthRequiredError（失败关闭）
+ *  - `get` / `query` 共用 `isVisible()` 规则（层可见性 + visibility + shared_list + sensitivity）
+ *  - **Sensitivity 硬过滤在 SQL 层完成**（JOIN sensitivity_overlay），不在内存后置过滤
+ *  - `query` 与 `get` 都执行 `shared_list` 白名单检查
+ *  - 写操作按能力位校验；owner/agent 必须与 auth 一致
+ *  - Purge 记录真实操作者（不再硬编码 'provider'）
+ *  - Minimize / Revive 走真实 Blob 读写（BlobStore）+ 路径逃逸防护
+ *  - reconcile 清理节点 / 两类边 / sensitivity_overlay / Outbox 残留
  */
 import { DatabaseSync } from './sqlite.ts';
+import { BlobStore, sha256 } from './blob-store.ts';
 import {
   type MemoryNode,
   type Edge,
@@ -25,23 +28,21 @@ import {
   nodeIdStr,
   revisionIdStr,
 } from './types.ts';
-import { type AuthContext, AuthRequiredError } from '../auth/context.ts';
-import type {
-  StorageTx,
-  NodeRef,
-  Cas,
-  Hit,
-  BlobHandle,
-  Subgraph,
-  TraverseBudget,
-} from './spi.ts';
+import {
+  type AuthContext,
+  type Sensitivity,
+  SENSITIVITY_LEVEL,
+  assertValidAuth,
+  ForbiddenError,
+  hasCap,
+  isVisible,
+  withinSensitivity,
+} from '../auth/context.ts';
+import type { StorageTx, NodeRef, Cas, Hit, BlobHandle, Subgraph, TraverseBudget } from './spi.ts';
 
 export interface ProviderOptions {
-  /** SQLite 数据库文件路径，或 ':memory:' */
   dbPath?: string;
-  /** Blob 根目录（默认不落盘，仅记录引用） */
   blobRoot?: string;
-  /** 跨进程写冲突等待（ms） */
   busyTimeoutMs?: number;
 }
 
@@ -70,34 +71,32 @@ interface NodeRow {
   agent_id: string | null;
   visibility: string;
   shared_with: string;
+  sensitivity_value?: string | null;
 }
 
 const UNIMPLEMENTED = (what: string) =>
-  Promise.reject(new Error(`UNIMPLEMENTED: ${what} — 属 M2/M4 范围（当前 M1-B 只实现基础存储）`));
+  Promise.reject(new Error(`UNIMPLEMENTED: ${what} — 属 M4 范围`));
 
 export class SqliteStorageProvider implements StorageTx {
   private readonly db: InstanceType<typeof DatabaseSync>;
-  private readonly blobRoot?: string;
-  /** 单写者：写事务串行化（同进程内） */
+  private readonly blobs?: BlobStore;
   private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(opts: ProviderOptions = {}) {
     this.db = new DatabaseSync(opts.dbPath ?? ':memory:');
-    this.blobRoot = opts.blobRoot;
+    this.blobs = opts.blobRoot ? new BlobStore(opts.blobRoot) : undefined;
     if (opts.dbPath && opts.dbPath !== ':memory:') {
-      // WAL 提升读写并发；busy_timeout 处理跨进程写冲突
       this.db.exec(`PRAGMA journal_mode=WAL;`);
       this.db.exec(`PRAGMA busy_timeout=${opts.busyTimeoutMs ?? 5000};`);
     }
     this.db.exec('PRAGMA foreign_keys=ON;');
   }
 
-  /** 事务包装：串行化 + 失败整体回滚 */
-  private async withTx<T>(fn: () => T): Promise<T> {
+  private async withTx<T>(fn: () => T | Promise<T>): Promise<T> {
     const run = async (): Promise<T> => {
       this.db.exec('BEGIN IMMEDIATE');
       try {
-        const out = fn();
+        const out = await fn();
         this.db.exec('COMMIT');
         return out;
       } catch (e) {
@@ -106,167 +105,178 @@ export class SqliteStorageProvider implements StorageTx {
       }
     };
     const next = this.writeChain.then(run, run);
-    // 保持链不因单次失败而断裂
     this.writeChain = next.catch(() => undefined);
     return next;
   }
 
-  // ───────────────────────── 读 ─────────────────────────
+  // ───────────────────────── 读（全部强制授权） ─────────────────────────
 
   async get(
     ref: NodeRef,
-    opts: { includeArchived?: boolean; auth?: AuthContext } = {}
+    auth: AuthContext,
+    opts: { includeArchived?: boolean } = {}
   ): Promise<MemoryNode | null> {
-    let row: NodeRow | undefined;
-    if (ref.kind === 'revision') {
-      row = this.db
-        .prepare('SELECT * FROM nodes WHERE revision_id=?')
-        .get(revisionIdStr(ref.revisionId)) as NodeRow | undefined;
-    } else {
-      row = this.db
-        .prepare("SELECT * FROM nodes WHERE node_id=? AND version_state='CURRENT'")
-        .get(nodeIdStr(ref.nodeId)) as NodeRow | undefined;
-    }
-    // 授权（P0-A）：带 auth 时检查可见性；不带 auth 仅供存储层内部使用
-    if (row && opts.auth) {
-      const a = opts.auth;
-      const n = this.rowToNode(row);
-      const visible =
-        n.scope.owner_id === a.ownerId &&
-        (n.scope.layer === 'user_identity' ||
-          (n.scope.layer === 'project' &&
-            n.scope.project_id !== null &&
-            a.projectIds.includes(n.scope.project_id)) ||
-          (n.scope.layer === 'global' && a.canReadGlobal) ||
-          ((n.scope.layer === 'agent_persona' || n.scope.layer === 'private_annotation') &&
-            n.scope.agent_id === a.agentId));
-      if (!visible) return null; // 不可见 → 等同不存在（不泄漏存在性）
-    }
+    const a = assertValidAuth(auth);
+    const row = this.loadRow(ref);
     if (!row) return null;
-    // PURGED 不落节点表（由 purge_ledger 承载）；此处只需处理业务可见性
-    if (!opts.includeArchived && row.content_state === 'TOMBSTONE') return null;
-    return this.rowToNode(row);
+    const node = this.rowToNode(row);
+    if (!isVisible(a, this.scopeViewOf(node), node.sensitivity)) return null;
+    if (!opts.includeArchived && node.content_state === 'TOMBSTONE') return null;
+    return node;
   }
 
-  /** 权限前置查询（P0-A）：必须携带可信 AuthContext，缺失即失败关闭。
-   *
-   *  授权推导规则（调用方不可绕过）：
-   *  - 强制 owner_id = auth.ownerId（工作空间绝对隔离）
-   *  - project 层：project_id 必须 ∈ auth.projectIds（可信成员关系，非客户端自述）
-   *  - global 层：需 auth.canReadGlobal
-   *  - agent_persona / private_annotation：仅 agent_id = auth.agentId 可见
-   *  - user_identity：仅 owner 本人可见
-   */
+  /** 内部无授权读取（仅供 reconcile / 迁移 / 测试断言；不对外暴露） */
+  async unsafeInternalGet(
+    ref: NodeRef,
+    opts: { includeArchived?: boolean } = {}
+  ): Promise<MemoryNode | null> {
+    const row = this.loadRow(ref);
+    if (!row) return null;
+    const node = this.rowToNode(row);
+    if (!opts.includeArchived && node.content_state === 'TOMBSTONE') return null;
+    return node;
+  }
+
   async query(
     q: { text?: string; scope?: Partial<Scope> },
     auth: AuthContext
   ): Promise<Hit[]> {
-    if (!auth || !auth.ownerId || !auth.agentId) throw new AuthRequiredError();
+    const a = assertValidAuth(auth);
 
+    // 权限 + 敏感级在 SQL 层前置过滤（P0-A5）
     const where: string[] = [
       "n.version_state='CURRENT'",
       "n.content_state IN ('FULL','MINIMIZED','STUB')",
       'n.owner_id = ?',
     ];
-    const params: (string | number)[] = [auth.ownerId];
+    const params: (string | number)[] = [a.ownerId];
 
-    // 层可见性由授权推导，不接受客户端传 layer
-    const visibleLayerExpr = [
-      `(n.layer = 'user_identity')`,
-      `(n.layer = 'project' AND n.project_id IN (${auth.projectIds.length ? auth.projectIds.map(() => '?').join(',') : "''"}))`,
-      `(n.layer = 'global' AND ${auth.canReadGlobal ? '1' : '0'} = 1)`,
+    // 敏感级上限：JOIN 覆盖层，超出即不进入候选
+    where.push(
+      `(CASE COALESCE(so.value,'normal')
+              WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 ELSE 2 END) <= ?`
+    );
+    params.push(SENSITIVITY_LEVEL[a.maxSensitivity]);
+
+    // 层可见性 + visibility（与 isVisible 同构，落成 SQL）
+    const layerCond = [
+      `(n.layer='user_identity')`,
+      `(n.layer='project' AND n.project_id IN (${a.projectIds.length ? a.projectIds.map(() => '?').join(',') : "''"}))`,
+      `(n.layer='global' AND ${a.canReadGlobal ? '1' : '0'} = 1)`,
       `(n.layer IN ('agent_persona','private_annotation') AND n.agent_id = ?)`,
     ].join(' OR ');
-    where.push(`(${visibleLayerExpr})`);
-    params.push(...auth.projectIds);
-    params.push(auth.agentId);
+    where.push(`(${layerCond})`);
+    params.push(...a.projectIds, a.agentId);
 
-    // 客户端可选的收窄条件（只能进一步缩小，不能扩大）
+    // visibility 规则（shared_list 必须命中当前 Agent）
+    where.push(
+      `(n.visibility IN ('owner','project_agents','all_agents')
+        OR (n.visibility='shared_list' AND EXISTS (
+              SELECT 1 FROM json_each(CASE WHEN json_valid(n.shared_with) THEN n.shared_with ELSE '[]' END) je
+              WHERE je.value = ?)))`
+    );
+    params.push(a.agentId);
+
     const sc = q.scope ?? {};
     if (sc.layer) {
       where.push('n.layer = ?');
       params.push(sc.layer);
     }
     if (sc.project_id) {
-      if (!auth.projectIds.includes(sc.project_id)) {
-        return []; // 未授权项目 → 空结果（不泄漏存在性）
-      }
+      if (!a.projectIds.includes(sc.project_id)) return [];
       where.push('n.project_id = ?');
       params.push(sc.project_id);
     }
     if (sc.agent_id) {
-      // 只能查自己
-      if (sc.agent_id !== auth.agentId) return [];
+      if (sc.agent_id !== a.agentId) return [];
       where.push('n.agent_id = ?');
       params.push(sc.agent_id);
     }
-    if (sc.visibility) {
-      where.push('n.visibility = ?');
-      params.push(sc.visibility);
-    }
 
-    // 文本检索：MVP 用简单的分词 LIKE（BM25 全量实现属 M4）
     if (q.text && q.text.trim()) {
-      const terms = q.text
-        .trim()
-        .split(/\s+/)
-        .filter(t => t.length > 0)
-        .slice(0, 8);
+      const terms = q.text.trim().split(/\s+/).filter(Boolean).slice(0, 8);
       for (const t of terms) {
-        where.push(`(n.stub_summary LIKE ? OR n.content_ref LIKE ?)`);
+        where.push('(n.stub_summary LIKE ? OR n.content_ref LIKE ?)');
         params.push(`%${t}%`, `%${t}%`);
       }
     }
 
-    const sql = `SELECT n.* FROM nodes n WHERE ${where.join(' AND ')}
+    const sql = `SELECT n.*, so.value AS sensitivity_value
+                 FROM nodes n
+                 LEFT JOIN sensitivity_overlay so ON so.node_id = n.node_id
+                 WHERE ${where.join(' AND ')}
                  ORDER BY n.revision_sequence DESC LIMIT 100`;
     const rows = this.db.prepare(sql).all(...params) as unknown as NodeRow[];
 
-    return rows.map(r => ({
-      node_id: asNodeId(r.node_id),
-      revision_id: asRevisionId(r.revision_id),
-      score: 1.0, // MVP：未实现评分函数（DDR T-B-04）
-      scope: this.rowToScope(r),
-    }));
+    return rows
+      .map(r => this.rowToNode(r))
+      .filter(n => isVisible(a, this.scopeViewOf(n), n.sensitivity)) // 兜底二次校验（防御 SQL 与 TS 规则漂移）
+      .map(n => ({
+        node_id: n.node_id,
+        revision_id: n.revision_id,
+        score: 1.0,
+        scope: n.scope,
+      }));
   }
 
-  async graphTraverse(_from: NodeId, _budget: TraverseBudget): Promise<Subgraph> {
+  async graphTraverse(_f: NodeRef, _b: TraverseBudget, _a: AuthContext): Promise<Subgraph> {
     return UNIMPLEMENTED('graphTraverse（图谱扩散）');
   }
 
-  async vectorSearch(_v: Float32Array, _budget: number): Promise<Hit[]> {
+  async vectorSearch(_v: Float32Array, _n: number, _a: AuthContext): Promise<Hit[]> {
     return UNIMPLEMENTED('vectorSearch（HNSW 向量检索）');
   }
 
   async blobRef(hash: ContentHash): Promise<BlobHandle> {
-    const dir = String(hash).replace(/^sha256:/, '');
-    return {
-      ref: `blobs/${dir.slice(0, 2)}/${dir}`,
-      hash,
-      inArchive: false,
-    };
+    return { ref: BlobStore.mainRefFor(String(hash)), hash, inArchive: false };
   }
 
-  // ───────────────────────── 写 ─────────────────────────
+  // ───────────────────────── 写（能力位 + 归属校验） ─────────────────────────
 
   async put(
     node: MemoryNode,
     edges: Edge[],
     outbox: OutboxEntry[],
+    auth: AuthContext,
     cas?: Cas
   ): Promise<TxResult> {
-    return this.putWithRevision(node, edges, outbox, cas);
+    return this.putWithRevision(node, edges, outbox, auth, cas);
   }
 
   async putWithRevision(
     node: MemoryNode,
     edges: Edge[],
     outbox: OutboxEntry[],
+    auth: AuthContext,
     cas?: Cas
   ): Promise<TxResult> {
     try {
+      const a = assertValidAuth(auth);
+      if (!hasCap(a, 'memory:write')) throw new ForbiddenError('PERMISSION_DENIED: 缺少 memory:write 能力');
+      // owner/agent 必须与授权身份一致（不能替别的 Agent 写）
+      if (node.scope.owner_id !== a.ownerId) {
+        throw new ForbiddenError('PERMISSION_DENIED: 不能写入其他工作空间的记忆');
+      }
+      if (
+        (node.scope.layer === 'agent_persona' || node.scope.layer === 'private_annotation') &&
+        node.scope.agent_id !== a.agentId
+      ) {
+        throw new ForbiddenError('PERMISSION_DENIED: 不能写入其他 Agent 的人格/私有注解');
+      }
+      if (
+        node.scope.layer === 'project' &&
+        (node.scope.project_id === null || !a.projectIds.includes(node.scope.project_id))
+      ) {
+        throw new ForbiddenError('PERMISSION_DENIED: 不是该项目成员，不能写入');
+      }
+      if (!withinSensitivity(a, node.sensitivity)) {
+        throw new ForbiddenError('PERMISSION_DENIED: 超出可写敏感级上限');
+      }
+      if (cas && !hasCap(a, 'memory:supersede')) {
+        throw new ForbiddenError('PERMISSION_DENIED: 缺少 memory:supersede 能力');
+      }
+
       return await this.withTx<TxResult>(() => {
-        // CAS：期望的当前链尾 revision 必须匹配
         if (cas) {
           const tail = this.db
             .prepare("SELECT revision_id FROM nodes WHERE node_id=? AND version_state='CURRENT'")
@@ -278,14 +288,10 @@ export class SqliteStorageProvider implements StorageTx {
               currentRevision: tail ? asRevisionId(tail.revision_id) : undefined,
             };
           }
-          // 顺序满足约束：① 新 revision 以 SUPERSEDED 占位插入（idx_nodes_current 只约束 CURRENT）
-          //              ② 旧链尾翻转并指向新 revision（引用完整性触发器此时可命中）
-          //              ③ 新 revision 升为 CURRENT
           this.insertNode({ ...node, version_state: 'SUPERSEDED' });
           this.db
             .prepare(
-              `UPDATE nodes SET version_state='SUPERSEDED', superseded_by_revision=?
-               WHERE revision_id=?`
+              `UPDATE nodes SET version_state='SUPERSEDED', superseded_by_revision=? WHERE revision_id=?`
             )
             .run(revisionIdStr(node.revision_id), tail.revision_id);
           this.db
@@ -294,217 +300,260 @@ export class SqliteStorageProvider implements StorageTx {
         } else {
           this.insertNode(node);
         }
-
         for (const e of edges) this.insertEdge(e);
         for (const o of outbox) this.insertOutbox(o);
         return { ok: true, revision_id: node.revision_id };
       });
     } catch (e) {
-      return { ok: false, error: this.classifyError(e) };
+      return this.asTxError(e);
     }
   }
 
-  async minimize(revisionId: RevisionId, archive: BlobHandle, cas: Cas): Promise<TxResult> {
-    // 能力边界（P0-B）：未配置归档存储时不允许调用，防止"状态变了但归档没落"的假成功
-    if (!this.blobRoot) return { ok: false, error: 'ARCHIVE_MISSING' };
+  /** 精简：真实写入归档文件 → 校验 → 再改状态 */
+  async minimize(nodeId: NodeId, auth: AuthContext, cas: Cas): Promise<TxResult> {
     try {
-      // 归档必须先真实落盘并校验 Hash（失败即不改库）
-      const archiveCheck = await this.writeArchive(archive);
-      if (!archiveCheck.ok) return { ok: false, error: 'ARCHIVE_MISSING' };
+      const a = assertValidAuth(auth);
+      if (!hasCap(a, 'memory:minimize')) throw new ForbiddenError('PERMISSION_DENIED: 缺少 memory:minimize 能力');
+      if (!this.blobs) return { ok: false, error: 'ARCHIVE_MISSING' };
 
+      const row = this.db
+        .prepare("SELECT * FROM nodes WHERE node_id=? AND version_state='CURRENT'")
+        .get(nodeIdStr(nodeId)) as NodeRow | undefined;
+      if (!row) return { ok: false, error: 'INVALID_STATE' };
+      const node = this.rowToNode(row);
+      if (!isVisible(a, this.scopeViewOf(node), node.sensitivity)) {
+        return { ok: false, error: 'PERMISSION_DENIED' };
+      }
+      if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
+        return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
+      }
+      if (row.content_state !== 'FULL' || !row.content_ref) {
+        return { ok: false, error: 'INVALID_STATE' };
+      }
+
+      // ① 读取主区原始内容
+      let original: Buffer;
+      try {
+        original = await this.blobs.read(row.content_ref);
+      } catch {
+        return { ok: false, error: 'ARCHIVE_MISSING' };
+      }
+      // ② 校验主区内容与记录一致
+      if (sha256(original) !== row.content_hash) {
+        return { ok: false, error: 'ARCHIVE_MISSING' };
+      }
+      // ③ 写入归档区
+      const archiveRef = BlobStore.archiveRefFor(row.node_id, row.revision_id);
+      const archiveHash = await this.blobs.write(archiveRef, original);
+      // ④ 校验归档文件真实存在且 Hash 一致（路径逃逸检查 + 真实读取）
+      await this.blobs.assertInsideRoot(archiveRef);
+      await this.blobs.readVerified(archiveRef, archiveHash);
+
+      // ⑤ 归档确认后才改状态；主区原始 Blob 保留（由 M2 的 GC 策略处理）
       return await this.withTx<TxResult>(() => {
-        const row = this.db
-          .prepare('SELECT * FROM nodes WHERE revision_id=?')
-          .get(revisionIdStr(revisionId)) as NodeRow | undefined;
-        if (!row) return { ok: false, error: 'INVALID_STATE' };
-        if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
-          return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
-        }
-        // MINIMIZED 状态与归档字段在同一 UPDATE 内变化（满足生命周期守卫）
         this.db
           .prepare(
-            `UPDATE nodes SET content_state='MINIMIZED', minimized_blob_ref=?, minimized_blob_hash=?
+            `UPDATE nodes SET content_state='MINIMIZED',
+               stub_summary=COALESCE(stub_summary, ?),
+               minimized_blob_ref=?, minimized_blob_hash=?
              WHERE revision_id=?`
           )
-          .run(archive.ref, String(archive.hash), row.revision_id);
+          .run(
+            `精简：${String(row.content_hash).slice(0, 24)}`,
+            archiveRef,
+            archiveHash,
+            row.revision_id
+          );
         return { ok: true, revision_id: asRevisionId(row.revision_id) };
       });
     } catch (e) {
-      return { ok: false, error: this.classifyError(e) };
+      return this.asTxError(e);
     }
   }
 
-  async purge(nodeId: NodeId, reasonCategory: string, cas: Cas): Promise<TxResult> {
+  /** 恢复：真实读取归档 → 校验 → 恢复主区 → 才改状态 */
+  async revive(revisionId: RevisionId, auth: AuthContext, cas: Cas): Promise<TxResult> {
     try {
+      const a = assertValidAuth(auth);
+      if (!hasCap(a, 'memory:revive')) throw new ForbiddenError('PERMISSION_DENIED: 缺少 memory:revive 能力');
+      if (!this.blobs) return { ok: false, error: 'ARCHIVE_MISSING' };
+
+      const row = this.db
+        .prepare('SELECT * FROM nodes WHERE revision_id=?')
+        .get(revisionIdStr(revisionId)) as NodeRow | undefined;
+      if (!row) return { ok: false, error: 'PURGED_FINAL' };
+      const node = this.rowToNode(row);
+      if (!isVisible(a, this.scopeViewOf(node), node.sensitivity)) {
+        return { ok: false, error: 'PERMISSION_DENIED' };
+      }
+      if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
+        return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
+      }
+      if (row.content_state !== 'MINIMIZED') {
+        return { ok: false, error: 'INVALID_STATE' };
+      }
+      if (!row.minimized_blob_ref || !row.minimized_blob_hash) {
+        return { ok: false, error: 'ARCHIVE_MISSING' };
+      }
+
+      // ① 读回归档并校验 Hash（失败即零副作用）
+      await this.blobs.assertInsideRoot(row.minimized_blob_ref);
+      const content = await this.blobs.readVerified(row.minimized_blob_ref, row.minimized_blob_hash);
+      // ② 校验内容与原始 content_hash 一致（证明恢复的是同一条记忆）
+      if (sha256(content) !== row.content_hash) {
+        return { ok: false, error: 'ARCHIVE_MISSING' };
+      }
+      // ③ 恢复到主区
+      const mainRef = BlobStore.mainRefFor(row.content_hash);
+      const restoredHash = await this.blobs.write(mainRef, content);
+      if (restoredHash !== row.content_hash) {
+        return { ok: false, error: 'ARCHIVE_MISSING' };
+      }
+
+      // ④ 主区恢复成功后才改状态
       return await this.withTx<TxResult>(() => {
-        // Purge 作用于整个逻辑记忆：CAS 校验对象是当前链尾
+        this.db
+          .prepare(
+            `UPDATE nodes SET content_state='FULL', content_ref=COALESCE(content_ref, ?),
+               minimized_blob_ref=NULL, minimized_blob_hash=NULL
+             WHERE revision_id=?`
+          )
+          .run(mainRef, row.revision_id);
+        return { ok: true, revision_id: asRevisionId(row.revision_id) };
+      });
+    } catch (e) {
+      return this.asTxError(e);
+    }
+  }
+
+  /** 硬擦除：需 memory:purge；Ledger 记录真实操作者 */
+  async purge(
+    nodeId: NodeId,
+    auth: AuthContext,
+    reasonCategory: string,
+    cas: Cas
+  ): Promise<TxResult> {
+    try {
+      const a = assertValidAuth(auth);
+      if (!hasCap(a, 'memory:purge')) throw new ForbiddenError('PERMISSION_DENIED: 缺少 memory:purge 能力');
+
+      return await this.withTx<TxResult>(() => {
         const row = this.db
           .prepare("SELECT * FROM nodes WHERE node_id=? AND version_state='CURRENT'")
           .get(nodeIdStr(nodeId)) as NodeRow | undefined;
         if (!row) return { ok: false, error: 'PURGED_FINAL' };
+        const node = this.rowToNode(row);
+        if (!isVisible(a, this.scopeViewOf(node), node.sensitivity)) {
+          return { ok: false, error: 'PERMISSION_DENIED' };
+        }
         if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
           return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
         }
-        // Ledger 必须覆盖该逻辑记忆的**全部** revision（防旧版本经备份/导入复活）
-        const allRevisions = this.db
-          .prepare('SELECT revision_id, content_hash FROM nodes WHERE node_id=?')
-          .all(row.node_id) as { revision_id: string; content_hash: string }[];
-        const ledgerInsert = this.db.prepare(
+
+        const all = this.db
+          .prepare('SELECT revision_id, content_hash, content_ref, minimized_blob_ref FROM nodes WHERE node_id=?')
+          .all(row.node_id) as {
+          revision_id: string;
+          content_hash: string;
+          content_ref: string | null;
+          minimized_blob_ref: string | null;
+        }[];
+
+        const ledger = this.db.prepare(
           `INSERT INTO purge_ledger(node_id, content_hash, operator, reason_category)
            VALUES(?,?,?,?)`
         );
-        for (const r of allRevisions) {
-          ledgerInsert.run(row.node_id, r.content_hash, 'provider', reasonCategory);
-        }
+        for (const r of all) ledger.run(row.node_id, r.content_hash, a.agentId, reasonCategory);
 
-        // 普通边端点用 node_id；supersedes 边端点用 revision_id
-        this.db
-          .prepare(
-            `DELETE FROM edges WHERE type <> 'supersedes' AND ("from"=? OR "to"=?)`
-          )
-          .run(row.node_id, row.node_id);
-        for (const r of allRevisions) {
-          this.db
-            .prepare(`DELETE FROM edges WHERE type = 'supersedes' AND ("from"=? OR "to"=?)`)
-            .run(r.revision_id, r.revision_id);
-        }
+        this.cleanupNodeRelations(row.node_id, all.map(r => r.revision_id));
+        this.db.prepare('DELETE FROM sensitivity_overlay WHERE node_id=?').run(row.node_id);
         this.db.prepare('DELETE FROM nodes WHERE node_id=?').run(row.node_id);
         return { ok: true, revision_id: asRevisionId(row.revision_id) };
       });
     } catch (e) {
-      return { ok: false, error: this.classifyError(e) };
+      return this.asTxError(e);
     }
   }
 
-  async revive(revisionId: RevisionId, cas: Cas): Promise<TxResult> {
-    // 归档校验必须在任何写操作之前完成（失败即不改库）
-    const row0 = this.db
-      .prepare('SELECT * FROM nodes WHERE revision_id=?')
-      .get(revisionIdStr(revisionId)) as NodeRow | undefined;
-    if (!row0) return { ok: false, error: 'PURGED_FINAL' };
-    if (row0.content_state === 'MINIMIZED' || row0.content_state === 'TOMBSTONE') {
-      const verified = await this.verifyArchive(row0.minimized_blob_ref, row0.minimized_blob_hash);
-      if (!verified) return { ok: false, error: 'ARCHIVE_MISSING' };
-    }
-    try {
-      return await this.withTx<TxResult>(() => {
-        const row = this.db
-          .prepare('SELECT * FROM nodes WHERE revision_id=?')
-          .get(revisionIdStr(revisionId)) as NodeRow | undefined;
-        if (!row) return { ok: false, error: 'PURGED_FINAL' };
-        if (revisionIdStr(cas.expectedRevision) !== row.revision_id) {
-          return { ok: false, error: 'CAS_CONFLICT', currentRevision: asRevisionId(row.revision_id) };
-        }
-        if (row.content_state === 'TOMBSTONE') {
-          // 归档原文仍在 → 回 FULL；否则降级为 STUB 并报 ARCHIVE_MISSING 由调用方处理
-          const hasArchive = row.minimized_blob_ref !== null;
-          this.db
-            .prepare(
-              `UPDATE nodes SET content_state=?, minimized_blob_ref=NULL, minimized_blob_hash=NULL
-               WHERE revision_id=?`
-            )
-            .run(hasArchive ? 'FULL' : 'STUB', row.revision_id);
-          if (!hasArchive && row.content_ref === null) {
-            return { ok: false, error: 'ARCHIVE_MISSING', currentRevision: asRevisionId(row.revision_id) };
-          }
-          return { ok: true, revision_id: asRevisionId(row.revision_id) };
-        }
-        if (row.content_state === 'MINIMIZED') {
-          if (row.minimized_blob_ref === null) {
-            return { ok: false, error: 'ARCHIVE_MISSING', currentRevision: asRevisionId(row.revision_id) };
-          }
-          this.db
-            .prepare(
-              `UPDATE nodes SET content_state='FULL', minimized_blob_ref=NULL, minimized_blob_hash=NULL
-               WHERE revision_id=?`
-            )
-            .run(row.revision_id);
-          return { ok: true, revision_id: asRevisionId(row.revision_id) };
-        }
-        return { ok: false, error: 'INVALID_STATE' };
-      });
-    } catch (e) {
-      return { ok: false, error: this.classifyError(e) };
-    }
-  }
-
-  /** 启动对账：Ledger 有而节点表仍有 → 补删（崩溃残留收敛） */
+  /** 对账：清理 Ledger 命中残留（节点 + 两类边 + 覆盖层 + Outbox） */
   async reconcile(): Promise<{ fixed: number }> {
     return this.withTx(() => {
       const orphans = this.db
         .prepare(
-          `SELECT n.node_id FROM nodes n
-           JOIN purge_ledger l ON l.node_id = n.node_id`
+          `SELECT n.node_id FROM nodes n JOIN purge_ledger l ON l.node_id = n.node_id GROUP BY n.node_id`
         )
         .all() as { node_id: string }[];
+
+      let fixed = 0;
       for (const o of orphans) {
+        const revs = this.db
+          .prepare('SELECT revision_id FROM nodes WHERE node_id=?')
+          .all(o.node_id) as { revision_id: string }[];
+        this.cleanupNodeRelations(o.node_id, revs.map(r => r.revision_id));
+        this.db.prepare('DELETE FROM sensitivity_overlay WHERE node_id=?').run(o.node_id);
+        this.db
+          .prepare("DELETE FROM outbox WHERE entity_id=?")
+          .run(o.node_id);
         this.db.prepare('DELETE FROM nodes WHERE node_id=?').run(o.node_id);
+        fixed += 1;
       }
-      return { fixed: orphans.length };
+
+      // 清理全库孤儿引用（边端点不存在、覆盖层无节点）
+      this.db.exec(`
+DELETE FROM edges WHERE type <> 'supersedes'
+  AND (NOT EXISTS (SELECT 1 FROM nodes WHERE node_id = edges."from")
+    OR NOT EXISTS (SELECT 1 FROM nodes WHERE node_id = edges."to"));
+DELETE FROM edges WHERE type = 'supersedes'
+  AND (NOT EXISTS (SELECT 1 FROM nodes WHERE revision_id = edges."from")
+    OR NOT EXISTS (SELECT 1 FROM nodes WHERE revision_id = edges."to"));
+DELETE FROM sensitivity_overlay WHERE NOT EXISTS (SELECT 1 FROM nodes WHERE node_id = sensitivity_overlay.node_id);
+`);
+      return { fixed };
     });
   }
 
-  /** 关闭数据库（测试用；确保 WAL 落盘） */
   close(): void {
     try {
       this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
     } catch {
-      /* 非 WAL 模式忽略 */
+      /* 非 WAL 忽略 */
     }
     this.db.close();
   }
 
-  /** 暴露底层 db 仅供测试断言约束（不用于业务写路径） */
   get raw(): InstanceType<typeof DatabaseSync> {
     return this.db;
   }
 
-  // ───────────────────── 内部 helpers ─────────────────────
+  // ───────────────────────── 内部 ─────────────────────────
 
-  // ── P0-B：归档真实存储与校验 ──
-
-  /** 写入归档文件：真实落盘 + 存在性 + Hash 校验 */
-  private async writeArchive(archive: BlobHandle): Promise<{ ok: boolean }> {
-    if (!this.blobRoot) {
-      // 未配置 blobRoot 时不冒充已归档（否则 Minimize 不可信）
-      return { ok: false };
+  private loadRow(ref: NodeRef): NodeRow | undefined {
+    if (ref.kind === 'revision') {
+      return this.db
+        .prepare(
+          `SELECT n.*, so.value AS sensitivity_value FROM nodes n
+           LEFT JOIN sensitivity_overlay so ON so.node_id = n.node_id
+           WHERE n.revision_id=?`
+        )
+        .get(revisionIdStr(ref.revisionId)) as NodeRow | undefined;
     }
-    const { mkdir, writeFile, readFile } = await import('node:fs/promises');
-    const { createHash } = await import('node:crypto');
-    const { dirname, join } = await import('node:path');
-    const abs = join(this.blobRoot, archive.ref);
-    try {
-      await mkdir(dirname(abs), { recursive: true });
-      // 归档内容由调用方通过 blobRef 提供；此处校验"内容已存在"或写入占位
-      // 真实内容来源：content_ref 指向的主区 blob（由上层读取后传入）
-      // 为可验证性，这里要求归档文件必须已由调用方写入，否则拒绝
-      const buf = await readFile(abs);
-      const h = 'sha256:' + createHash('sha256').update(buf).digest('hex');
-      return { ok: h === String(archive.hash) };
-    } catch {
-      // 文件不存在 → 尝试创建空占位再校验（生产由上层写入真实内容）
-      try {
-        await mkdir(dirname(abs), { recursive: true });
-        await writeFile(abs, '');
-        return { ok: false };
-      } catch {
-        return { ok: false };
-      }
-    }
+    return this.db
+      .prepare(
+        `SELECT n.*, so.value AS sensitivity_value FROM nodes n
+         LEFT JOIN sensitivity_overlay so ON so.node_id = n.node_id
+         WHERE n.node_id=? AND n.version_state='CURRENT'`
+      )
+      .get(nodeIdStr(ref.nodeId)) as NodeRow | undefined;
   }
 
-  /** 校验归档文件存在且 Hash 匹配（Revive 前置条件） */
-  private async verifyArchive(ref: string | null, expectedHash: string | null): Promise<boolean> {
-    if (!ref || !this.blobRoot) return false;
-    const { readFile } = await import('node:fs/promises');
-    const { createHash } = await import('node:crypto');
-    const { join } = await import('node:path');
-    try {
-      const buf = await readFile(join(this.blobRoot, ref));
-      const h = 'sha256:' + createHash('sha256').update(buf).digest('hex');
-      return expectedHash ? h === expectedHash : true;
-    } catch {
-      return false;
+  private cleanupNodeRelations(nodeId: string, revisionIds: string[]): void {
+    this.db
+      .prepare(`DELETE FROM edges WHERE type <> 'supersedes' AND ("from"=? OR "to"=?)`)
+      .run(nodeId, nodeId);
+    for (const r of revisionIds) {
+      this.db
+        .prepare(`DELETE FROM edges WHERE type = 'supersedes' AND ("from"=? OR "to"=?)`)
+        .run(r, r);
     }
   }
 
@@ -548,14 +597,24 @@ export class SqliteStorageProvider implements StorageTx {
         visibility: scope.visibility,
         shared_with: JSON.stringify(scope.shared_with ?? []),
       });
+
+    // sensitivity 覆盖层（非 normal 才写，normal 视为缺省）
+    if (node.sensitivity && node.sensitivity !== 'normal') {
+      this.db
+        .prepare(
+          `INSERT INTO sensitivity_overlay(node_id, value, updated_by, reason)
+           VALUES(?,?,?,?)
+           ON CONFLICT(node_id) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by`
+        )
+        .run(nodeIdStr(node.node_id), node.sensitivity, node.provenance?.agent_id ?? 'unknown', 'write');
+    }
   }
 
   private insertEdge(e: Edge): void {
     const isSupersedes = e.type === 'supersedes';
     this.db
       .prepare(
-        `INSERT INTO edges(type, link_class, "from", "to", weight, created_at)
-         VALUES(?,?,?,?,?,?)`
+        `INSERT INTO edges(type, link_class, "from", "to", weight, created_at) VALUES(?,?,?,?,?,?)`
       )
       .run(
         e.type,
@@ -576,13 +635,24 @@ export class SqliteStorageProvider implements StorageTx {
       .run(o.kind, o.entity_id, o.seq, o.payload === undefined ? null : JSON.stringify(o.payload));
   }
 
+  private scopeViewOf(n: MemoryNode) {
+    return {
+      owner_id: n.scope.owner_id,
+      layer: n.scope.layer,
+      project_id: n.scope.project_id,
+      agent_id: n.scope.agent_id,
+      visibility: n.scope.visibility,
+      shared_with: n.scope.shared_with,
+    };
+  }
+
   private rowToScope(r: NodeRow): Scope {
     let shared: string[] = [];
     try {
       const parsed = JSON.parse(r.shared_with);
       if (Array.isArray(parsed)) shared = parsed as string[];
     } catch {
-      /* 非法 JSON 由 DB CHECK 拦截，此处兜底 */
+      /* DB CHECK 保证合法 */
     }
     return {
       owner_id: r.owner_id,
@@ -610,11 +680,7 @@ export class SqliteStorageProvider implements StorageTx {
         confidence: r.confidence,
       };
     }
-    // sensitivity 读覆盖层（可变），缺省 normal
-    const ov = this.db
-      .prepare('SELECT value FROM sensitivity_overlay WHERE node_id=?')
-      .get(r.node_id) as { value: 'normal' | 'sensitive' | 'restricted' } | undefined;
-
+    const sens = (r.sensitivity_value ?? 'normal') as Sensitivity;
     return {
       node_id: asNodeId(r.node_id),
       revision_id: asRevisionId(r.revision_id),
@@ -630,7 +696,7 @@ export class SqliteStorageProvider implements StorageTx {
       confidence: r.confidence,
       provenance,
       scope: this.rowToScope(r),
-      sensitivity: ov?.value ?? 'normal',
+      sensitivity: sens,
       valid_from: r.valid_from,
       valid_until: r.valid_until,
       ingested_at: r.ingested_at,
@@ -638,14 +704,18 @@ export class SqliteStorageProvider implements StorageTx {
     };
   }
 
-  private classifyError(e: unknown): TxResult extends { error: infer E } ? E : never {
+  private asTxError(e: unknown): TxResult {
+    if (e instanceof ForbiddenError) return { ok: false, error: 'PERMISSION_DENIED' };
     const msg = e instanceof Error ? e.message : String(e);
-    if (/STATE_CONFLICT/.test(msg)) return 'STATE_CONFLICT' as never;
-    if (/MEM_IMMUTABLE/.test(msg)) return 'STATE_CONFLICT' as never;
-    if (/PURGED_FINAL/.test(msg)) return 'PURGED_FINAL' as never;
-    if (/STUB_IMMUTABLE/.test(msg)) return 'STUB_IMMUTABLE' as never;
-    if (/SCOPE_INVALID|CHECK|constraint/i.test(msg)) return 'SCOPE_INVALID' as never;
-    if (/UNIQUE/.test(msg)) return 'CAS_CONFLICT' as never;
-    throw e; // 未预期错误不吞掉
+    if (/AUTH_CONTEXT_REQUIRED|PERMISSION_DENIED/.test(msg)) return { ok: false, error: 'PERMISSION_DENIED' };
+    if (/BLOB_PATH_REJECTED/.test(msg)) return { ok: false, error: 'PERMISSION_DENIED' };
+    if (/ARCHIVE_MISSING/.test(msg)) return { ok: false, error: 'ARCHIVE_MISSING' };
+    if (/STATE_CONFLICT/.test(msg)) return { ok: false, error: 'STATE_CONFLICT' };
+    if (/MEM_IMMUTABLE/.test(msg)) return { ok: false, error: 'STATE_CONFLICT' };
+    if (/PURGED_FINAL/.test(msg)) return { ok: false, error: 'PURGED_FINAL' };
+    if (/STUB_IMMUTABLE/.test(msg)) return { ok: false, error: 'STUB_IMMUTABLE' };
+    if (/SCOPE_INVALID|CHECK|constraint/i.test(msg)) return { ok: false, error: 'SCOPE_INVALID' };
+    if (/UNIQUE/.test(msg)) return { ok: false, error: 'CAS_CONFLICT' };
+    throw e;
   }
 }
