@@ -22,7 +22,8 @@
 
 - **定位**：跨框架通用记忆层——任何 agent 框架（Claude Code / Cursor / DSH / 自研）均可接入，一份记忆处处可用
 - **理念**：本地优先、数据归用户（洛书开放格式）；记忆是活的图谱；**内容用户掌生杀权，系统掌结构整理权**
-- **明确不做（MVP）**：跨设备同步 / 云托管 / 多用户（owner_id 预留）/ 具身实现（JSON 扩展位）/ 内置大模型
+- **明确不做（MVP）**：跨设备同步 / 云托管 / 具身实现（JSON 扩展位）/ 内置大模型
+  - ~~多用户（owner_id 预留）~~ → **v1.5 修订**：`owner_id` 已正式定义为**工作空间边界**，多 Agent 共享同一工作空间已进入实现基线（见上方 ADR 与 §1.3）。仍不做：跨组织 / 跨租户 / 互联网范围的全局共享
 - **P2 延后项（设计已留接口，不进本轮）**：图谱扩散 / 边衰减 GC / LLM 消歧 / 反思 SCHEDULED 模式 / 实体自动合并 / 多租户
 
 ---
@@ -51,8 +52,48 @@
 │   链尾唯一性：存储层条件写 + 确定性 tie-break               │
 │   graph-traverse 契约：hub 抑制 / 扩散预算 / 超时降级       │
 ├ 扩展层（预留接口，不实现）───────────────────────────────┤
-│ 具身（JSON 扩展位）/ 跨设备同步 / 云托管 / 多用户 owner_id  │
+│ 具身（JSON 扩展位）/ 跨设备同步 / 云托管                    │
 └────────────────────────────────────────────────────────┘
+
+### 1.3 授权模型与敏感级过滤（v1.5 新增，替代 v1.4 的 owner_id 预留说明）
+
+**身份与边界**
+
+| 概念 | 含义 | 不是什么 |
+|---|---|---|
+| `owner_id` | 工作空间边界（一个用户或一个组织） | **不是** Agent ID，不是单个记忆的创建者 |
+| `agent_id` | 人格 / 私有注解的归属对象 | 不是权限边界 |
+| `project_id` | 项目共享空间 | 不是用户私有空间 |
+| `provenance.agent_id` | 内容的实际贡献者（审计） | 不代表当前请求身份 |
+
+**AuthContext**（由经 Token 验证的服务层构造，存储层只接受不推断）
+
+```
+ownerId         工作空间边界
+agentId         当前 Agent 身份
+projectIds      经可信成员关系验证的项目集
+canReadGlobal   是否可读工作空间 global 层
+maxSensitivity  可读敏感级上限
+capabilities    写能力位（write/supersede/minimize/revive/purge）
+```
+
+**可见性规则**（`get` 与 `query` 共用同一套 `isVisible()`）
+
+1. **工作空间：** `scope.owner_id` 必须等于 `auth.ownerId`（绝对隔离）
+2. **敏感级硬过滤：** `sensitivity_overlay` 值超出 `maxSensitivity` 即不进入候选（SQL 层完成，**不是排序因子**）
+3. **层可见性：**
+   - `user_identity` → 当前工作空间内可见
+   - `project` → `project_id ∈ auth.projectIds`（成员关系验证，非客户端自述）
+   - `global` → 需 `canReadGlobal`
+   - `agent_persona` / `private_annotation` → 仅 `agent_id === auth.agentId`
+4. **visibility 语义：**
+   - `owner` / `project_agents` / `all_agents`：按层规则已约束
+   - `shared_list`：**必须** `shared_with.includes(auth.agentId)`（项目成员 ≠ 白名单成员）
+5. **不可见 = 不存在：** `get` 返回 `null`，`query` 不返回该条，不泄露存在性
+
+**写权限：** `put` / `minimize` / `revive` / `purge` 分别需 `memory:write` / `memory:minimize` / `memory:revive` / `memory:purge` 能力位；写入 `owner_id` / `agent_id` 必须与 `auth` 一致；`purge_ledger.operator` 记录**真实操作者**。
+
+**能力边界**：`AuthContext` 的 Token 解析、会话绑定与项目成员关系查询属 **M1-C**；存储层强制要求上下文完整且不可绕过，但不自行验证签名。
 
 ### 1.1 Storage SPI 事务与原子性契约（收敛 P0-3 补充）
 
