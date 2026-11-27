@@ -460,8 +460,10 @@ describe('P0-C · Blob 路径逃逸防护', () => {
 
   it('绝对路径 → 拒绝', () => {
     const blobs = new BlobStore(blobRoot);
-    expect(() => blobs.resolve('C:/Windows/system32/evil.txt')).toThrow(/BLOB_PATH_REJECTED/);
+    // POSIX 绝对路径（Linux CI 与 Windows 都会判定为 isAbsolute）
     expect(() => blobs.resolve('/etc/passwd')).toThrow(/BLOB_PATH_REJECTED/);
+    // 反斜杠形式的穿越同样拒绝（Windows 风格）
+    expect(() => blobs.resolve('..\\..\\evil.txt')).toThrow(/BLOB_PATH_REJECTED/);
   });
 
   it('合法归档引用 → 允许', async () => {
