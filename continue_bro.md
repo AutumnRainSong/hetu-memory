@@ -16,7 +16,7 @@
 - **内容用户掌生杀权，系统掌结构整理权**——用户操作精简/删除；图谱自净（GC）自动运行但不可被用户直接指挥
 - **数据在用户手里**——本地优先，开放交换格式（洛书 Luoshu，接替 OMXF），服务挂了数据还在
 
-完整设计文档在 `agent-memory-module-design.md`（v1.2），开放格式草案在 `omxf-open-format.md`，与外部评审者的两轮协商记录在 `reply-round2-reflection-gc.md`。**先读完这三份再说话。**
+完整设计文档在 `docs/agent-memory-module-design.md`（**v1.5，唯一正式主规格**），开放格式在 `docs/hetu-luoshu-format.md`（洛书 v0.3）。**先读主规格再动手。**
 
 ## 必须刻进骨子里的设计纪律（违反任何一条都是事故）
 
@@ -33,7 +33,7 @@
 
 ## 当前真实状态（2026-11-25）
 
-- **当前位置**：分支 `fix/review-r2`（Review R2 定点修订，尚未合并 main）
+- **当前位置**：分支 `fix/review-r3`（Review R2 定点修订，尚未合并 main）
 - **main 基线**：`bd0842e1`
 - **测试**：13 文件 / **153 项全绿**；lint ✅ tsc ✅ 类型契约 ✅ 依赖审计 **0 漏洞**
 - **M1-A Rev4 已交付待独立复审**：
