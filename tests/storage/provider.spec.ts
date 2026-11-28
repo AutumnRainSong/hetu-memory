@@ -107,8 +107,8 @@ async function writeFullMemory(
   auth: AuthContext,
   scope: Partial<Scope> = {}
 ) {
-  const hash = await blobs.write(BlobStore.mainRefFor(sha256(Buffer.from(content))), content);
-  const ref = BlobStore.mainRefFor(hash);
+  const hash = await blobs.write(BlobStore.mainRefFor(auth.ownerId, sha256(Buffer.from(content))), content);
+  const ref = BlobStore.mainRefFor(auth.ownerId, hash);
   const r = await provider.put(
     node({
       node_id: nodeId,
@@ -395,8 +395,8 @@ describe('P0-C · Minimize / Revive 真实内容闭环', () => {
     await sp.minimize(asNodeId('m1'), authA, { expectedRevision: asRevisionId('r1') });
 
     // 删掉主区文件，证明 Revive 确实重建了它
-    await blobs.remove(BlobStore.mainRefFor(hash));
-    expect(await blobs.exists(BlobStore.mainRefFor(hash))).toBe(false);
+    await blobs.remove(BlobStore.mainRefFor(authA.ownerId, hash));
+    expect(await blobs.exists(BlobStore.mainRefFor(authA.ownerId, hash))).toBe(false);
 
     const r = await sp.revive(asRevisionId('r1'), authA, { expectedRevision: asRevisionId('r1') });
     expect(r.ok).toBe(true);
@@ -468,15 +468,23 @@ describe('P0-C · Blob 路径逃逸防护', () => {
 
   it('合法归档引用 → 允许', async () => {
     const blobs = new BlobStore(blobRoot);
-    const ref = BlobStore.archiveRefFor('mem-1', 'rev-1');
+    const ref = BlobStore.archiveRefFor('ws-1', 'sha256:' + 'a'.repeat(64));
     await blobs.write(ref, 'content');
     expect(await blobs.exists(ref)).toBe(true);
   });
 
-  it('node_id 含路径字符时归档引用被安全化', () => {
-    const ref = BlobStore.archiveRefFor('../../etc', '../passwd');
-    expect(ref.startsWith('archive/')).toBe(true);
+  it('archiveRefFor 强制 owner 命名空间 + 内容寻址，路径不含 ..', () => {
+    // B 组 R4：archiveRefFor 现在是 (ownerId, hash)，不再用 node/revision，天然跳过路径段穿越
+    const ref = BlobStore.archiveRefFor('ws-1', 'sha256:' + 'b'.repeat(64));
+    expect(ref.startsWith('workspaces/')).toBe(true);
+    expect(ref).toContain('/archive/');
+    // ownerKey 是摘要，不含原始 owner_id
+    expect(ref).not.toContain('ws-1/');
     expect(ref).not.toContain('..');
+    // 同一 owner 同 hash 得到稳定同一引用（内容寻址去重）
+    expect(BlobStore.archiveRefFor('ws-1', 'sha256:' + 'b'.repeat(64))).toBe(ref);
+    // 不同 owner 同 hash → 不同路径（物理隔离）
+    expect(BlobStore.archiveRefFor('ws-2', 'sha256:' + 'b'.repeat(64))).not.toBe(ref);
   });
 });
 

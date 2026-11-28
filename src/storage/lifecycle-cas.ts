@@ -6,10 +6,17 @@
  *             + minimized_blob_ref + minimized_blob_hash（缺一不可）
  *  - changes !== 1  绝不得报告成功，必须返回 STATE_CONFLICT
  *
- *  这些函数是**纯函数**：只产出 SQL 与参数，由 Lead 接入 sqlite-provider.ts。
- *  Lead 在最终事务内执行 spec.sql + spec.params 后调用 assertSingleRow(stmt.run(...).changes)。
- *  本模块不触碰 provider；跨连接并发一致性由「条件 UPDATE + changes 校验」共同保证。
+ *  本模块为 C 组独占纯函数；由 Lead 接入 sqlite-provider.ts。
+ *
+ *  R4-INTEGRATION（Lead 修复）：
+ *  - Minimize 在写入归档文件后，**必须先对该 owner namespace 登记 archive 引用**
+ *    （registerBlobRef，确保 blob_objects 处于 ACTIVE），否则 purge 的原子认领
+ *    找不到该对象 → claim 返回 NOT_ACTIVE → 归档文件永不物理删除（泄漏）。
+ *  - 本文件额外导出 `registerArchiveForMinimize` 供 Lead 在 minimize 事务内调用。
  */
+import type { Db } from './blob-lifecycle.ts';
+import { registerBlobRef } from './blob-lifecycle.ts';
+
 export interface CasUpdateSpec {
   sql: string;
   params: unknown[];
@@ -57,25 +64,16 @@ WHERE revision_id=? AND version_state='CURRENT' AND content_state='MINIMIZED'
 });
 
 /**
- * C-3 · 单行断言。changes===1 → 成功；否则 STATE_CONFLICT。
- * 绝不在实际未更新（0 行 / 多行异常）时报告成功。
+ * C-3 · 断言恰好命中一行；否则返回 STATE_CONFLICT（绝不在实际未更新时报告成功）。
  */
 export const assertSingleRow = (
-  changes: number
+  changes: number | bigint
 ): { ok: true } | { ok: false; error: 'STATE_CONFLICT' } =>
-  typeof changes === 'number' && changes === 1 ? { ok: true } : { ok: false, error: 'STATE_CONFLICT' };
+  Number(changes) === 1 ? { ok: true } : { ok: false, error: 'STATE_CONFLICT' };
 
 /**
  * C-4 · 失败孤儿文件登记：把「DB 提交失败后已写入磁盘、但未被引用」的归档文件
- * 登记进 blob_cleanup_tasks 队列（契约 §3 ③），由 A 组 cleanup worker 补偿删除。
- *
- * 幂等：使用 INSERT OR IGNORE —— 若该 (owner_key, blob_ref) 已存在 pending/claimed/failed 任务
- * （partial unique index idx_cleanup_active），则忽略，不产生重复任务。
- *
- * @param db    DatabaseSync 或兼容 prepare/run 的连接。写走调用方事务。
- * @param args  ownerKey：ownerKeyFor('owner') 的摘要；blobRef：孤儿归档相对引用；kind：'archive'
- * @returns     ok 恒为 true（失败由下层抛错向上传播，绝不由本函数吞掉）；
- *              enqueued=true 表示本次新插入任务，false 表示已存在同类任务（幂等跳过）。
+ * 登记进 blob_cleanup_tasks 队列，由 A 组 cleanup worker 补偿删除。（幂等）
  */
 export const recordOrphanForCleanup = (
   db: { prepare(sql: string): { run(...params: unknown[]): { changes: number | bigint } } },
@@ -88,4 +86,31 @@ export const recordOrphanForCleanup = (
     )
     .run(args.ownerKey, args.blobRef, args.kind);
   return { ok: true, enqueued: Number(res.changes) === 1 };
+};
+
+/**
+ * Minimize 补登记（Lead 集成）：
+ * 把新写入的 archive 对象登记为 ACTIVE + 一条引用；主区 blob 在 put 时已登记。
+ * 若不登记，purge 原子认领找不到该 archive 对象 → 永久泄漏。
+ */
+export const registerArchiveForMinimize = (
+  db: Db,
+  args: {
+    ownerKey: string;
+    archiveRef: string;
+    archiveHash: string;
+    nodeId: string;
+    revisionId: string;
+  }
+)
+: { ok: boolean; error?: 'BLOB_BUSY' } => {
+  const res = registerBlobRef(db, {
+    ownerKey: args.ownerKey,
+    blobRef: args.archiveRef,
+    nodeId: args.nodeId,
+    revisionId: args.revisionId,
+    kind: 'archive',
+    contentHash: args.archiveHash,
+  });
+  return res.ok ? { ok: true } : { ok: false, error: 'BLOB_BUSY' };
 };

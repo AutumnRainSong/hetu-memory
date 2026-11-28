@@ -17,7 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SqliteStorageProvider } from '../../src/storage/sqlite-provider.ts';
-import { BlobStore, sha256 } from '../../src/storage/blob-store.ts';
+import { BlobStore, sha256, ownerKeyFor } from '../../src/storage/blob-store.ts';
 import { runMigrations } from '../../src/storage/migrate.ts';
 import type { AuthContext as AuthT } from '../../src/auth/context.ts';
 import {
@@ -164,22 +164,29 @@ describe('R3-01 · Purge 清除本地 Blob', () => {
     expect(marks.length).toBe(0);
   });
 
-  it('reconcile 补偿：pending 的文件删除被补删', async () => {
+  it('reconcile 补偿：blob_cleanup_tasks 里的 pending 文件被补删', async () => {
     const blobs = new BlobStore(blobRoot);
     await writeFull(sp, blobs, 'm1', 'r1', 'content');
     await sp.purge(asNodeId('m1'), authA, 'user-request', { expectedRevision: asRevisionId('r1') });
 
-    // 模拟文件删除失败：插入一条指向仍存在文件的 pending 标记
+    // R4：撤销阶段二实际已完成删除后的表语义。模拟一条仍指向存在文件的 pending 清理任务
+    //   （真实场景：unlink 失败留下的任务，reconcile 应补删）。
     const leftover = 'blobs/ab/abcdef';
     await blobs.write(leftover, 'leftover');
     sp.raw
-      .prepare("INSERT INTO purge_blob_marks(node_id, blob_ref, kind, operator) VALUES('m1',?, 'main','agent-a')")
-      .run(leftover);
+      .prepare(
+        "INSERT INTO blob_cleanup_tasks(owner_key, blob_ref, kind, status) VALUES(?,?, 'main', 'pending')"
+      )
+      .run(ownerKeyFor('ws-1'), leftover);
 
     expect(await blobs.exists(leftover)).toBe(true);
     const res = await sp.reconcile();
     expect(res.filesRemoved).toBeGreaterThan(0);
     expect(await blobs.exists(leftover)).toBe(false);
+    // 任务已补删，不再残留 pending
+    expect(
+      (sp.raw.prepare("SELECT COUNT(*) c FROM blob_cleanup_tasks WHERE blob_ref=?").get(leftover) as any).c
+    ).toBe(0);
   });
 
   it('文件删除失败时保留 pending 状态，不返回"硬擦除成功"的绝对担保', async () => {

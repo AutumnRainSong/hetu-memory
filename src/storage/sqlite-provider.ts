@@ -13,7 +13,7 @@
 import { DatabaseSync } from './sqlite.ts';
 import { BlobStore, sha256, ownerKeyFor } from './blob-store.ts';
 import { registerBlobRef, planPurge, runCleanup, reconcileBlobs, type ReconcileResult } from './blob-lifecycle.ts';
-import { buildMinimizeUpdate, buildReviveUpdate, assertSingleRow, recordOrphanForCleanup } from './lifecycle-cas.ts';
+import { buildMinimizeUpdate, buildReviveUpdate, assertSingleRow, recordOrphanForCleanup, registerArchiveForMinimize } from './lifecycle-cas.ts';
 import {
   type MemoryNode,
   type Edge,
@@ -380,8 +380,18 @@ export class SqliteStorageProvider implements StorageTx {
       // ④ 校验归档文件真实存在且 Hash 一致（write/read 已内建符号链接安全解析）
       await this.blobs.readVerified(archiveRef, archiveHash);
 
-      // ⑤ R4-C1：最终状态检查与条件更新在同一事务内，且校验 affected rows
+      // ⑤ R4-C1：最终状态检查与条件更新在同一事务内，且校验 affected rows。
+      //    先登记归档对象（否则 purge 原子认领找不到 → 归档泄漏）；再 CAS 更新。
       return await this.withTx<TxResult>(() => {
+        const reg = registerArchiveForMinimize(this.db, {
+          ownerKey: ownerKeyFor(row.owner_id),
+          archiveRef,
+          archiveHash,
+          nodeId: row.node_id,
+          revisionId: row.revision_id,
+        });
+        if (!reg.ok) return { ok: false, error: 'STATE_CONFLICT' };
+
         const spec = buildMinimizeUpdate({
           revisionId: row.revision_id,
           archiveRef,

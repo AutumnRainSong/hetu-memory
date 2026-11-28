@@ -171,12 +171,12 @@ describe('C-5 · 两个独立 Provider 连接同一文件库 · Minimize 并发'
     }
   });
 
-  it('对照组：现状 provider.minimize 两连接都返回 ok（缺陷实证），库内仍无二义', async () => {
+  it('真实 Provider minimize 并发：CAS 修复后恰好一个成功、一个 STATE_CONFLICT', async () => {
     const ctx = setup();
     try {
       const CONTENT = 'provider-race-content';
       const hex = sha256(Buffer.from(CONTENT)).replace(/^sha256:/, '');
-      const mainRef = `blobs/${hex.slice(0, 2)}/${hex}`;
+      const mainRef = BlobStore.mainRefFor(authA.ownerId, `sha256:${hex}`);
       await ctx.blobs.write(mainRef, CONTENT);
       await ctx.p1.put(
         node('m1', 'r1', { content_hash: asContentHash(sha256(Buffer.from(CONTENT))), content_ref: mainRef }),
@@ -189,10 +189,12 @@ describe('C-5 · 两个独立 Provider 连接同一文件库 · Minimize 并发'
         ctx.p1.minimize(asNodeId('m1'), authA, { expectedRevision: asRevisionId('r1') }),
         ctx.p2.minimize(asNodeId('m1'), authA, { expectedRevision: asRevisionId('r1') }),
       ]);
-      // 现状代码最后 UPDATE 无 content_state 条件、不检查 changes → 两连接都返回 ok:true
-      // 这正是 R4 要修的真实竞态：同一操作被报告成功两次。
-      expect(a.ok).toBe(true);
-      expect(b.ok).toBe(true);
+      // R4 修好后：最终 UPDATE 带 content_state CAS + changes===1 → 恰好一个成功，另一个 STATE_CONFLICT
+      const wins = [a, b].filter(r => r.ok);
+      const conflict = [a, b].filter(r => !r.ok);
+      expect(wins.length).toBe(1);
+      expect(conflict.length).toBe(1);
+      expect((conflict[0] as any).error).toBe('STATE_CONFLICT');
 
       const cur = (await ctx.p1.unsafeInternalGet(byNode('m1')))!;
       expect(cur.version_state).toBe('CURRENT');

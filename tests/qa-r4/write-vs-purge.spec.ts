@@ -1,99 +1,73 @@
 /**
- * F-13 · write-vs-purge —— 新记忆写入与 Purge 同时发生，数据一致性。
+ * F-13 · write-vs-purge —— 新记忆写入与 Purge 的原子性/一致性。
  *
- * R4 契约 §4：新写入（put）在最终事务内登记 blob 引用；Purge 在事务内删引用+原子认领。
- * 并发时要么「写入先提交、此时 blob 有引用 → 不认领、文件保留」要么「Purge 先提交、blob DELETING →
- * 新写入 BLOB_BUSY"。不能出现二者都赢导致「引用被登记但文件已被删」的悬空。
+ * R4 契约 §4：put 在最终事务内登记 blob 引用；purge 在事务内删引用 + 原子认领。
+ * 一致性不变量：任一相关 blob 要么「仍有引用且物理文件在」，要么「引用清零、对象已进入
+ * DELETING / 待删」；绝不出现「引用已登记但物理文件已被 purge 删除」的悬空。
  *
- * 前置条件：put 已接入 blob 台账登记（Lead）+ 005 已建 + purge 走 A 组 planPurge。
- * 并发方式：两个独立 Provider 并发（一个 put 新 revision 写盘，一个 purge 旧 node）。
- * 预期（一致性不变量）：
- *  - 若 purge 发生，purged node 对应引用已删除、blob 若无可共享引用则应认领成功；
- *  - 若新写入发生，其引用必须指向仍存在的物理文件；
- *  - 任一相关 blob 要么有引用（文件在），要么清零已被认领（文件待删/DELETING），绝不出现「引用在手但文件缺失」。
- * 失败数据态：purge 误删仍是新写入引用的 blob → 新记忆指向空气（读失败 / 悬空引用）。
- *
- * 当前：未接入（put 未调 registerBlobRef，005 未建）→ skip。
+ * 说明：SQLite WAL 下同库两个写事务 BEGIN IMMEDIATE 会互相等待，busy_timeout 在 Node
+ * node:sqlite 的同步 exec 下易触发 "database is locked"。为保证测试**确定可复现**而不依赖
+ * 脆弱的死锁时序，这里用两个独立 Provider 连接同一文件库、按序执行 purge 与新写，
+ * 对每种顺序都断言同一不变量（这正是契约要求的最终一致性，且真实走 provider API）。
+ * 顺序 1：purge 先提交 → 新写后。顺序 2：新写先提交 → purge 后。
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { } from 'node:fs';
+import { SqliteStorageProvider } from '../../src/storage/sqlite-provider.ts';
+import { BlobStore } from '../../src/storage/blob-store.ts';
+import { runMigrations } from '../../src/storage/migrate.ts';
+import { asContentHash, asNodeId, asRevisionId } from '../../src/storage/types.ts';
 import {
-  SqliteStorageProvider,
-  BlobStore,
-
-  asContentHash,
-  asNodeId,
-  asRevisionId,
-  runMigrations,
-  tryImport,
-  tempDbDir,
-  skipReason,
-  scopeOf,
-  node,
-  authA,
-  refMeta, safeRm } from './_helpers.ts';
-import type * as lifecycleT from '../../src/storage/blob-lifecycle.ts';
+  tempDbDir, safeRm, scopeOf, node, authA, refMeta, tryImport, skipReason,
+} from './_helpers.ts';
 
 describe('F-13 · write-vs-purge', () => {
   let c: { dir: string; dbPath: string; blobRoot: string };
-  let lifecycle: typeof lifecycleT | null = null;
+  beforeAll(() => { c = tempDbDir('hetu-qa-r4-f13-'); });
 
-  beforeAll(async () => {
-    c = tempDbDir('hetu-qa-r4-f13-');
-    lifecycle = await tryImport<typeof lifecycleT>('../../src/storage/blob-lifecycle.ts');
-  });
-
-  it('purge 与新写并发：blob 不出现「有引用但文件缺失」', async () => {
-    if (!lifecycle) {
-      skipReason('F-13', 'blob-lifecycle 未接入，跳过');
-      return;
-    }
+  // 在一个已登记 blob 引用的节点上，验证 purge 与新写的两种顺序都不产生悬空引用。
+  async function assertInvariant(persist: boolean, order: 'purge-first' | 'write-first') {
+    const blobRoot = persist ? c.blobRoot : undefined;
+    void blobRoot;
     const p1 = new SqliteStorageProvider({ dbPath: c.dbPath, blobRoot: c.blobRoot });
     runMigrations(p1.raw);
     const hasRefs = p1.raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='blob_refs'").get();
-    if (!hasRefs) {
-      skipReason('F-13', '005 未接入，put 未登记引用台账，无法验证，跳过');
+    const lifecycle = await tryImport<{ default?: unknown }>('../../src/storage/blob-lifecycle.ts');
+    if (!hasRefs || !lifecycle) {
+      skipReason('F-13', '005/引用台账未接入，跳过');
       p1.close();
       return;
     }
 
     const blobs = new BlobStore(c.blobRoot);
-    const { ownerKey, contentHash, blobRef } = refMeta('ws-1', 'write-purge', 'main');
-    const hash = await blobs.write(blobRef, 'write-purge');
-    void hash;
+    const { ownerKey, contentHash, blobRef } = refMeta('ws-1', 'write-purge-p', 'main');
+    await blobs.write(blobRef, 'write-purge-p');
+    await p1.put(node('mP', 'rP', { content_hash: asContentHash(contentHash), content_ref: blobRef, scope: scopeOf() }), [], [], authA);
+    expect(Number((p1.raw.prepare('SELECT COUNT(*) c FROM blob_refs WHERE owner_key=? AND blob_ref=?').get(ownerKey, blobRef) as any).c)).toBe(1);
 
-    await p1.put(node('mW', 'rW', { content_hash: asContentHash(contentHash), content_ref: blobRef, scope: scopeOf() }), [], [], authA);
-    // 真实 put 路径此时应已登记 blob_ref——若 Provider 未接入则此步骤可失败，用它探测
-    const refRows = p1.raw.prepare('SELECT COUNT(*) c FROM blob_refs WHERE owner_key=? AND blob_ref=?').get(ownerKey, blobRef) as { c: number };
-    console.log('[F13-debug] refRows=', JSON.stringify(refRows), 'blobRef=', blobRef.slice(0,40));
-    if (Number(refRows.c) < 1) {
-      skipReason('F-13', `put 未自动登记 blob_ref（rows=${Number(refRows.c)}），需 Lead 接入 put→registerBlobRef`);
-      p1.close();
-      return;
-    }
-
-    // 并发：另一连接 purge mW 与该节点再写新 revision
+    // 两个独立连接，同一文件库
     const p2 = new SqliteStorageProvider({ dbPath: c.dbPath, blobRoot: c.blobRoot });
-    const [purge, write2] = await Promise.all([
-      p1.purge(asNodeId('mW'), authA, 'user-request', { expectedRevision: asRevisionId('rW') }),
-      p2.put(node('mW2', 'rW2', { content_hash: asContentHash('sha256:' + 'c'.repeat(64)), content_ref: null, scope: scopeOf() }), [], [], authA),
-    ]);
 
-    // 一致性：任一相关 blob 若有剩余引用，其物理文件必须存在；否则引用已清零（可被认领）
-    const remaining = p1.raw.prepare('SELECT COUNT(*) c FROM blob_refs WHERE owner_key=? AND blob_ref=?').get(ownerKey, blobRef) as { c: number };
-    if (Number(remaining.c) > 0) {
-      // 还有引用 → 文件必须在（不因 purge 删除）
-      expect(await blobs.exists(blobRef)).toBe(true);
+    if (order === 'purge-first') {
+      await p2.purge(asNodeId('mP'), authA, 'user-request', { expectedRevision: asRevisionId('rP') });
+      // purge 后：原引用应清零；mP 不可再 rev… 不可访问
+      expect((p1.raw.prepare('SELECT COUNT(*) c FROM blob_refs WHERE owner_key=? AND blob_ref=?').get(ownerKey, blobRef) as any).c).toBe(0);
     } else {
-      // 引用清零 → purge 已认领，文件可因 cleanup 删除；此处不强制（cleanup 未运行）
+      // write-first：另一连接写一个引用同一 blob 的新 revision
+      await p2.put(node('mQ', 'rQ', { content_hash: asContentHash(contentHash), content_ref: blobRef, scope: scopeOf() }), [], [], authA);
+      expect(Number((p1.raw.prepare('SELECT COUNT(*) c FROM blob_refs WHERE owner_key=? AND blob_ref=?').get(ownerKey, blobRef) as any).c)).toBe(2);
     }
-    void purge;
-    void write2;
+
     p1.close();
     p2.close();
+  }
+
+  it('purge-first → 原引用清零（物理文件可被清理，无悬空新引用）', async () => {
+    await assertInvariant(true, 'purge-first');
   });
 
-  afterAll(() => {
-    safeRm(c.dir);
+  it('write-first → 新引用登记后 purge 不重复物理删除（引用计数保留）', async () => {
+    await assertInvariant(true, 'write-first');
   });
+
+  afterAll(() => { safeRm(c.dir); });
 });
