@@ -1,0 +1,522 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/AutumnRainSong/hetu-memory/schemas/luoshu-v0.3.schema.json",
+  "title": "洛书 Luoshu v0.3 — 河图开放记忆交换格式",
+  "type": "object",
+  "required": [
+    "format",
+    "version",
+    "exported_at",
+    "exporter",
+    "owner_id",
+    "nodes",
+    "edges",
+    "purge_ledger"
+  ],
+  "properties": {
+    "format": {
+      "const": "luoshu"
+    },
+    "version": {
+      "const": "0.3"
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "exporter": {
+      "type": "object",
+      "required": [
+        "product",
+        "version"
+      ],
+      "properties": {
+        "product": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "owner_id": {
+      "type": "string",
+      "description": "导出者身份（元数据，非权限判定依据）"
+    },
+    "purge_ledger": {
+      "type": "array",
+      "description": "擦除账本全量投影；导入先应用。不含正文/operator 脱敏。",
+      "items": {
+        "type": "object",
+        "required": [
+          "purge_seq",
+          "node_id",
+          "content_hash",
+          "timestamp",
+          "reason_category"
+        ],
+        "properties": {
+          "purge_seq": {
+            "type": "integer"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "content_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "reason_category": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/node"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/edge"
+      }
+    }
+  },
+  "definitions": {
+    "scope": {
+      "type": "object",
+      "required": [
+        "owner_id",
+        "layer",
+        "visibility"
+      ],
+      "properties": {
+        "owner_id": {
+          "type": "string"
+        },
+        "layer": {
+          "enum": [
+            "user_identity",
+            "agent_persona",
+            "global",
+            "project",
+            "private_annotation"
+          ]
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visibility": {
+          "enum": [
+            "owner",
+            "project_agents",
+            "all_agents",
+            "shared_list"
+          ]
+        },
+        "shared_with": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "layer": {
+                "const": "project"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "project_id"
+            ],
+            "properties": {
+              "project_id": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "layer": {
+                "enum": [
+                  "agent_persona",
+                  "private_annotation"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "agent_id"
+            ],
+            "properties": {
+              "agent_id": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "layer": {
+                "const": "private_annotation"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "visibility": {
+                "const": "owner"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "agent_id",
+        "origin",
+        "method",
+        "source_refs",
+        "producer_version",
+        "generated_at",
+        "confidence"
+      ],
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "origin": {
+          "enum": [
+            "hot-path",
+            "session-digest",
+            "reflection"
+          ]
+        },
+        "method": {
+          "enum": [
+            "rule",
+            "model-assisted",
+            "user-confirmed"
+          ]
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "producer_version": {
+          "type": "string"
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": [
+        "node_id",
+        "revision_id",
+        "revision_sequence",
+        "content_hash",
+        "version_state",
+        "content_state",
+        "modality",
+        "confidence",
+        "provenance",
+        "scope",
+        "sensitivity",
+        "valid_from",
+        "ingested_at"
+      ],
+      "properties": {
+        "node_id": {
+          "type": "string"
+        },
+        "revision_id": {
+          "type": "string"
+        },
+        "revision_sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "version_state": {
+          "enum": [
+            "current",
+            "superseded"
+          ]
+        },
+        "content_state": {
+          "enum": [
+            "full",
+            "minimized",
+            "stub",
+            "tombstone"
+          ]
+        },
+        "content_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stub_summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "minimized_blob_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^archive/.+"
+        },
+        "minimized_blob_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "modality": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "provenance": {
+          "$ref": "#/definitions/provenance"
+        },
+        "scope": {
+          "$ref": "#/definitions/scope"
+        },
+        "sensitivity": {
+          "enum": [
+            "normal",
+            "sensitive",
+            "restricted"
+          ]
+        },
+        "valid_from": {
+          "type": "string"
+        },
+        "valid_until": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ingested_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "superseded_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extensions": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "content_state": {
+                "const": "stub"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "stub_summary"
+            ],
+            "properties": {
+              "stub_summary": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "content_state": {
+                "const": "minimized"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "minimized_blob_ref",
+              "minimized_blob_hash",
+              "stub_summary"
+            ],
+            "properties": {
+              "stub_summary": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minimized_blob_ref": {
+                "type": "string",
+                "pattern": "^archive/.+"
+              },
+              "minimized_blob_hash": {
+                "type": "string",
+                "pattern": "^sha256:[a-f0-9]{64}$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "content_state": {
+                "const": "full"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "content_ref"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "edge": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "from",
+            "to",
+            "weight",
+            "created_at"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "cooccur",
+                "annotation",
+                "link"
+              ]
+            },
+            "link_class": {
+              "enum": [
+                "pinned",
+                "explicit",
+                "inferred"
+              ]
+            },
+            "from": {
+              "type": "string",
+              "description": "NodeId — 逻辑记忆身份"
+            },
+            "to": {
+              "type": "string",
+              "description": "NodeId — 逻辑记忆身份"
+            },
+            "weight": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "from",
+            "to",
+            "weight",
+            "created_at"
+          ],
+          "properties": {
+            "type": {
+              "const": "supersedes"
+            },
+            "from": {
+              "type": "string",
+              "description": "RevisionId — superseding 版本"
+            },
+            "to": {
+              "type": "string",
+              "description": "RevisionId — 被替代版本"
+            },
+            "weight": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,28 @@
+name: CI
+
+# 同分支连续 push 时自动取消过时的中间 run，只保留最新一次（防刷屏）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main, 'fix/**', 'feat/**']
+  pull_request:
+    branches: [main]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Dependency audit (fail on high/critical)
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org/
+      - run: npm run lint
+      - run: npm run build
+      - name: Type contract tests (branded ids)
+        run: npm run typecheck
+      - run: npm test

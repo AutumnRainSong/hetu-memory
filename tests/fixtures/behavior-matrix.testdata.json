@@ -1,0 +1,598 @@
+{
+  "meta": {
+    "version_states": [
+      "CURRENT",
+      "SUPERSEDED"
+    ],
+    "content_states": [
+      "FULL",
+      "MINIMIZED",
+      "STUB",
+      "TOMBSTONE",
+      "PURGED"
+    ],
+    "operations": [
+      "remember",
+      "recall",
+      "introspect",
+      "minimize",
+      "forget",
+      "purge",
+      "revive",
+      "supersede"
+    ],
+    "unit_count": 80,
+    "reachable_units": 56,
+    "unreachable_units": 24,
+    "note": "SUPERSEDED × {MINIMIZED,TOMBSTONE,PURGED} 为不可达组合（历史随链尾级联）；56 格行为测试 + 24 格不可达属性证明"
+  },
+  "cases": [
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "remember",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "FULL"
+      },
+      "note": "闸门四操作，ADD 追加新 revision"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "recall",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "introspect",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "minimize",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "MINIMIZED"
+      }
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "forget",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "TOMBSTONE"
+      },
+      "confirm": "host-ui"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "purge",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "PURGED"
+      },
+      "confirm": "host-ui",
+      "note": "Ledger 先行提交点→级联删除"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "revive",
+      "expect": "DENY",
+      "error": "INVALID_STATE"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "FULL"
+      },
+      "op": "supersede",
+      "expect": "ALLOW",
+      "transition": {
+        "version": "SUPERSEDED",
+        "newVersion": "CURRENT"
+      }
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "remember",
+      "expect": "DENY",
+      "error": "STUB_IMMUTABLE"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "recall",
+      "expect": "ALLOW",
+      "note": "仅摘要"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "introspect",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "minimize",
+      "expect": "ALLOW",
+      "note": "幂等"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "forget",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "TOMBSTONE"
+      }
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "purge",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "PURGED"
+      }
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "revive",
+      "expect": "DENY",
+      "error": "INVALID_STATE"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "STUB"
+      },
+      "op": "supersede",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "remember",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT",
+      "note": "复活走 Revive"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "recall",
+      "expect": "DENY",
+      "error": "MEM_TOMBSTONED"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "introspect",
+      "expect": "ALLOW",
+      "note": "仅元数据 id/状态/时间"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "minimize",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "forget",
+      "expect": "ALLOW",
+      "note": "幂等"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "purge",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "PURGED"
+      },
+      "note": "purge() 唯一硬擦除入口，豁免写短路"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "revive",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "FULL"
+      },
+      "confirm": "host-ui",
+      "note": "原文在则 FULL，缺失→ARCHIVE_MISSING 降级"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "TOMBSTONE"
+      },
+      "op": "supersede",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "remember",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT",
+      "note": "提示用 supersede"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "recall",
+      "expect": "ALLOW",
+      "note": "时间显式命中正常权重沿链返回；非时间命中硬降权"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "introspect",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "minimize",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "forget",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT",
+      "note": "对链尾 Forget 即整链级联"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "purge",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT",
+      "note": "同上"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "revive",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "FULL"
+      },
+      "op": "supersede",
+      "expect": "ALLOW",
+      "note": "链尾继续（仅在合法链结构下）"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "remember",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "recall",
+      "expect": "ALLOW",
+      "note": "仅 stub 句供链追溯"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "introspect",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "minimize",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "forget",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "purge",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "revive",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "STUB"
+      },
+      "op": "supersede",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "remember",
+      "expect": "DENY",
+      "error": "STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "recall",
+      "expect": "ALLOW",
+      "note": "仅摘要，标 minimized"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "introspect",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "minimize",
+      "expect": "ALLOW",
+      "note": "幂等"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "forget",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "TOMBSTONE"
+      },
+      "note": "级联删归档区"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "purge",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "PURGED"
+      },
+      "note": "级联删归档区"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "revive",
+      "expect": "ALLOW",
+      "transition": {
+        "content": "FULL"
+      },
+      "note": "校验 minimized_blob_hash；缺失→ARCHIVE_MISSING 降级摘要级"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "MINIMIZED"
+      },
+      "op": "supersede",
+      "expect": "ALLOW"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "remember",
+      "expect": "ALLOW",
+      "note": "等同全新记忆"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "recall",
+      "expect": "DENY",
+      "error": "PURGED_FINAL"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "introspect",
+      "expect": "ALLOW",
+      "note": "仅 Marker 元数据"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "minimize",
+      "expect": "DENY",
+      "error": "PURGED_FINAL"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "forget",
+      "expect": "DENY",
+      "error": "PURGED_FINAL"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "purge",
+      "expect": "DENY",
+      "error": "PURGED_FINAL",
+      "note": "幂等"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "revive",
+      "expect": "DENY",
+      "error": "PURGED_FINAL"
+    },
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "op": "supersede",
+      "expect": "DENY",
+      "error": "PURGED_FINAL"
+    }
+  ],
+  "unreachable": [
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "TOMBSTONE"
+      },
+      "reason": "Forget/Purge 优先于 supersede：历史版本随链尾级联，对历史节点单独删除拒绝 STATE_CONFLICT"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "PURGED"
+      },
+      "reason": "PURGED 由 Purge Ledger 承载而非节点状态；历史版本随链尾级联"
+    },
+    {
+      "state": {
+        "version": "SUPERSEDED",
+        "content": "MINIMIZED"
+      },
+      "reason": "历史版本随链尾级联，不可单独归档"
+    }
+  ],
+  "non_node_states": [
+    {
+      "state": {
+        "version": "CURRENT",
+        "content": "PURGED"
+      },
+      "note": "节点物理不存在；由 Purge Ledger 承载。所有工具查询前置 Ledger 检查：remember=W(等同全新)/recall=E(PURGED_FINAL)/purge=幂等/revive=DENY(PURGED_FINAL)"
+    }
+  ]
+}
