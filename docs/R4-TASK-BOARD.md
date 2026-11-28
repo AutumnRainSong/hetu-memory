@@ -1,7 +1,7 @@
 # 河图 HeTu · R4 统一任务看板
 
 > **基线**：`ebcd1310e8aa0ac988bd0f6c9fdb1e50b220a148`
-> **集成人**：lead　|　**更新**：状态随集成实时刷新
+> **集成人**：lead　|　**更新**：2026-11-28　**r4/integration HEAD** `183429c`（375 测试全绿）
 > **图例**：⬜ 未开始　🟦 进行中　🟨 待集成　🟩 已验收　🟥 阻塞
 
 ---
@@ -11,7 +11,7 @@
 | ID | 工作线 | 任务 | 负责人 | 状态 | 依赖 | 分支 | Commit SHA | 测试状态 | 阻塞/风险 |
 |---|---|---|---|---|---|---|---|---|---|
 | **P0-1** | 集成 | 冻结接口契约（§2.1–2.6） | lead | 🟩 已完成 | — | `r4/integration` | 本文档 | — | 待产品负责人批准 |
-| **P0-2** | 集成 | 建 6 条工作分支 | lead | ⬜ 未开始 | P0-1 | — | — | — | 等批准 |
+| **P0-2** | 集成 | 建 6 条工作分支 | lead | 🟩 已验收 | P0-1 | r4/* | ebcd1310 | — | — |
 | A-1 | A · Purge | `blob_refs` 台账表（Migration 005） | agt-purge | ⬜ 未开始 | 契约 | `r4/a-purge` | — | — | — |
 | A-2 | A · Purge | `registerBlobRefs()` 纯函数（供 put 调用） | agt-purge | ⬜ 未开始 | A-1 | `r4/a-purge` | — | — | 接入由集成人打补丁 |
 | A-3 | A · Purge | `planAndMarkPurge()` 逻辑删除 + 引用计数判定 | agt-purge | ⬜ 未开始 | A-1 | `r4/a-purge` | — | — | — |
@@ -25,7 +25,7 @@
 | B-4 | B · Blob | 临时文件 + rename 原子写（防 TOCTOU） | agt-blob | ⬜ 未开始 | B-3 | `r4/b-blobstore` | — | — | — |
 | B-5 | B · Blob | `remove()` 区分 ENOENT 与其他错误 | agt-blob | ⬜ 未开始 | — | `r4/b-blobstore` | — | — | — |
 | B-6 | B · Blob | 跨 owner 物理隔离验证 | agt-blob | ⬜ 未开始 | B-1 | `r4/b-blobstore` | — | — | — |
-| C-1 | C · 生命周期 | Minimize 事务内重校验 + 条件 UPDATE + changes 检查 | agt-lifecycle | ⬜ 未开始 | 契约 | `r4/c-lifecycle` | — | — | — |
+| C-1 | C · 生命周期 | Minimize 事务内重校验 + 条件 UPDATE + changes 检查 | agt-lifecycle | 🟩 已验收 | 契约 | `r4/c-lifecycle` | `183429c` | 21 ✅ | — |
 | C-2 | C · 生命周期 | Revive 同上（含 ref/hash CAS） | agt-lifecycle | ⬜ 未开始 | C-1 | `r4/c-lifecycle` | — | — | — |
 | C-3 | C · 生命周期 | 失败孤儿文件登记 | agt-lifecycle | ⬜ 未开始 | C-1, A-1 | `r4/c-lifecycle` | — | — | — |
 | C-4 | C · 生命周期 | 跨连接真实并发测试 | agt-lifecycle | ⬜ 未开始 | C-1, C-2 | `r4/c-lifecycle` | — | — | Windows 稳定性 |
@@ -84,6 +84,7 @@
 | 阶段 | HEAD SHA | lint | build | typecheck | test | audit | 结论 |
 |---|---|---|---|---|---|---|---|
 | 基线 ebcd1310 | `ebcd1310` | ✅ | ✅ | ✅ | 178 ✅ | 0 漏洞 | 基线可用 |
+| **P4 集成 HEAD** | `183429c` | ✅ | ✅ | ✅ | **375 ✅** | 0 漏洞 | R4 集成分支全绿 |
 | P2 集成后 | — | — | — | — | — | — | 待填 |
 | P3 集成后 | — | — | — | — | — | — | 待填 |
 | P4 最终 | — | — | — | — | — | — | 待填 |
