@@ -92,8 +92,8 @@ function node(
 }
 
 async function writeFull(sp: SqliteStorageProvider, blobs: BlobStore, nid: string, rid: string, content: string) {
-  const hash = await blobs.write(BlobStore.mainRefFor(sha256(Buffer.from(content))), content);
-  const ref = BlobStore.mainRefFor(hash);
+  const hash = await blobs.write(BlobStore.mainRefFor('ws-1', sha256(Buffer.from(content))), content);
+  const ref = BlobStore.mainRefFor('ws-1', hash);
   const r = await sp.put(node(nid, rid, { content_hash: asContentHash(hash), content_ref: ref }), [], [], authA);
   expect(r.ok).toBe(true);
   return { hash, ref };
@@ -204,9 +204,9 @@ describe('R3-01 · Purge 清除本地 Blob', () => {
     const blobs = new BlobStore(blobRoot);
     const { ref: rf1 } = await writeFull(sp, blobs, 'm1', 'r1', 'v1-content');
     // 产生第二个 revision
-    const hash2 = await blobs.write(BlobStore.mainRefFor(sha256(Buffer.from('v2-content'))), 'v2-content');
+    const hash2 = await blobs.write(BlobStore.mainRefFor('ws-1', sha256(Buffer.from('v2-content'))), 'v2-content');
     const r2 = await sp.put(
-      node('m1', 'r2', { revision_sequence: 2, content_hash: asContentHash(hash2), content_ref: BlobStore.mainRefFor(hash2) }),
+      node('m1', 'r2', { revision_sequence: 2, content_hash: asContentHash(hash2), content_ref: BlobStore.mainRefFor('ws-1', hash2) }),
       [],
       [],
       authA,
@@ -217,7 +217,7 @@ describe('R3-01 · Purge 清除本地 Blob', () => {
     await sp.purge(asNodeId('m1'), authA, 'user-request', { expectedRevision: asRevisionId('r2') });
 
     expect(await blobs.exists(rf1)).toBe(false);
-    expect(await blobs.exists(BlobStore.mainRefFor(hash2))).toBe(false);
+    expect(await blobs.exists(BlobStore.mainRefFor('ws-1', hash2))).toBe(false);
   });
 });
 
